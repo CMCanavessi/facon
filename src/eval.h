@@ -4,9 +4,12 @@
 // Returns a score in centipawns (100 = one pawn advantage) from the
 // perspective of the side to move. Positive = good for the mover.
 //
-// Facón 1.0 evaluation:
+// Facon 1.0 — Oxido
 //   - Material count
 //   - Piece-square tables (PST): bonus/penalty per piece per square
+//
+// Facon 1.1 — Herrumbre
+//   - King safety: penalty for enemy pieces attacking the king zone
 // =============================================================================
 
 #pragma once

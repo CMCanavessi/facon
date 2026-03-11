@@ -1,5 +1,5 @@
 // =============================================================================
-// types.h — Core type definitions for the Facón chess engine
+// types.h — Core type definitions for the Facon chess engine
 //
 // This file defines all the fundamental types used throughout the engine:
 // squares, pieces, colors, moves, and bitboards.
@@ -11,6 +11,7 @@
 #include <cstdint>   // uint8_t, uint16_t, uint32_t, uint64_t
 #include <string>    // std::string
 #include <cassert>   // assert()
+#include <cmath>     // std::abs() in is_mate_score()
 
 // =============================================================================
 // BASIC TYPES

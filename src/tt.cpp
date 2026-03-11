@@ -4,6 +4,7 @@
 
 #include "tt.h"
 #include <iostream>
+#include <cstring>   // std::memset() in clear()
 
 // Global TT instance
 TranspositionTable TT;
@@ -84,12 +85,6 @@ bool TranspositionTable::probe(uint64_t hash, TTEntry& out) const {
 
     out = entry;
     return true;
-}
-
-Move TranspositionTable::probe_move(uint64_t hash) const {
-    const TTEntry& entry = table_[index(hash)];
-    if (entry.hash != hash) return MOVE_NONE;
-    return entry.move;
 }
 
 // =============================================================================

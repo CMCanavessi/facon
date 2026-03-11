@@ -63,7 +63,7 @@ Move UCI::parse_move(const std::string& str) {
 // =============================================================================
 
 void UCI::cmd_uci() {
-    std::cout << "id name Facon 1.0 - Oxido\n";
+    std::cout << "id name Facon 1.1 - Herrumbre\n";
     std::cout << "id author Carlos M. Canavessi\n";
     std::cout << "\n";
     std::cout << "option name Hash type spin default 16 min 1 max 1024\n";

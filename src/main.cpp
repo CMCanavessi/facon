@@ -1,5 +1,5 @@
 // =============================================================================
-// main.cpp — Facón Chess Engine entry point
+// main.cpp — Facon Chess Engine entry point
 //
 // Initializes all subsystems and enters the UCI loop.
 // =============================================================================

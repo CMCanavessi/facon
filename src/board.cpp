@@ -7,6 +7,8 @@
 #include <iostream>
 #include <iomanip>
 #include <random>
+#include <cctype>    // tolower() in set_fen()
+#include <cmath>     // std::abs() in make_move()
 
 // =============================================================================
 // ZOBRIST TABLES — definitions (declared extern in board.h)
@@ -478,13 +480,30 @@ void Board::unmake_null_move() {
 // =============================================================================
 // MOVE LEGALITY
 // =============================================================================
-// A move is legal if it does not leave our own king in check.
-// We make the move on a copy of the board and test whether the king is attacked.
+// A move is legal if:
+//   1. The from-square contains a piece belonging to the side to move.
+//   2. The move does not leave our own king in check.
+//
+// Check (1) is done first — it is O(1) and avoids the expensive board copy
+// for moves that come from a stale or hash-collided TT entry. Without this
+// guard, make_move() on a from-square that has NO_PIECE (or the wrong color)
+// silently "moves nothing", the king stays safe, and is_legal() incorrectly
+// returns true — causing illegal PV moves to be printed in long games where
+// the TT is full of entries from earlier positions.
 
 bool Board::is_legal(Move m) const {
+    Square from = from_sq(m);
+    Piece  p    = piece_on[from];
+
+    // Reject immediately if from-square is empty or holds the opponent's piece.
+    // This catches the most common source of ghost moves from TT collisions.
+    if (p == NO_PIECE || color_of(p) != side_to_move)
+        return false;
+
+    // Full legality check: make the move on a copy and verify the king is safe.
+    // After make_move(), side_to_move has flipped — our king is ~copy.side_to_move.
     Board copy = *this;
     copy.make_move(m);
-    // After the move, side_to_move has flipped — our king is ~copy.side_to_move
     return !copy.is_attacked(copy.king_square(~copy.side_to_move), copy.side_to_move);
 }
 

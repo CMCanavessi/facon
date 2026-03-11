@@ -64,10 +64,6 @@ public:
     // for this hash. Returns false if the slot is empty or hash doesn't match.
     bool probe(uint64_t hash, TTEntry& entry) const;
 
-    // Returns the best move stored for this position, or MOVE_NONE if not found.
-    // Faster than probe() when only the move is needed.
-    Move probe_move(uint64_t hash) const;
-
     // Estimate how full the table is (per-mille, 0..1000).
     // Used for the UCI "info hashfull" output.
     int hashfull() const;
