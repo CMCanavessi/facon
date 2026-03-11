@@ -25,7 +25,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(facon VERSION 1.0 LANGUAGES CXX)
+project(facon VERSION 1.1 LANGUAGES CXX)
 
 # =============================================================================
 # OPTIONS
@@ -68,7 +68,7 @@ set(SOURCES
 )
 
 add_executable(facon ${SOURCES})
-set_target_properties(facon PROPERTIES OUTPUT_NAME "facon-1.0")
+set_target_properties(facon PROPERTIES OUTPUT_NAME "facon-1.1")
 
 # =============================================================================
 # COMPILER FLAGS
