@@ -1,7 +1,7 @@
 # Facón Chess Engine
 
 <p align="center">
-  <img src="Logo.png" alt="Facon Chess Engine" width="320"/>
+  <img src="docs/img/Logo.png" alt="Facon Chess Engine" width="320"/>
 </p>
 
 A UCI-compliant chess engine written in C++17.
