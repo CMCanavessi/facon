@@ -1,0 +1,50 @@
+// =============================================================================
+// version.rc — Windows version resource for Facón chess engine
+//
+// Compiled by MinGW windres when building for Windows (WIN32 only).
+// Provides metadata visible in Explorer -> Properties -> Details tab:
+// FileDescription, CompanyName, FileVersion, ProductVersion, etc.
+//
+// Changelog:
+//   1.2 — Initial version resource. Introduced to provide engine metadata
+//         on Windows and to replace the -static global link flag (which
+//         triggered Windows Defender false positives) with selective linking.
+// =============================================================================
+
+#include <windows.h>
+
+// Version numbers must match CMakeLists.txt project(facon VERSION ...)
+#define VERSION_MAJOR 1
+#define VERSION_MINOR 2
+#define VERSION_PATCH 0
+#define VERSION_BUILD 0
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, VERSION_BUILD
+PRODUCTVERSION  VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, VERSION_BUILD
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"   // Language: English (US), Code page: Unicode
+        BEGIN
+            VALUE "FileDescription",  "Facon Chess Engine"
+            VALUE "FileVersion",      "1.2.0.0"
+            VALUE "ProductName",      "Facon"
+            VALUE "ProductVersion",   "1.2.0.0"
+            VALUE "CompanyName",      "Carlos M. Canavessi"
+            VALUE "LegalCopyright",   "Copyright (C) 2025 Carlos M. Canavessi"
+            VALUE "InternalName",     "facon-1.2"
+            VALUE "OriginalFilename", "facon-1.2.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200   // English (US), Unicode
+    END
+END

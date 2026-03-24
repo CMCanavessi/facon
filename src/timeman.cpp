@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-14 00:00
 // timeman.cpp — Time management implementation
 //
 // Facon 1.1 — Herrumbre
@@ -21,11 +22,26 @@
 //     engine found something bad; extra time helps find a way out.
 //   Both conditions can apply simultaneously (multiplicative).
 //   The extended soft limit is always capped at hard_limit.
+//
+// Facon 1.2 -- Rojo Vivo
+//   - Verbosity: start() reports base, soft, and hard limits computed for each
+//     move. extend_time() reports trigger reason, old/new soft, and headroom.
+//     These are pure stdout writes with no effect on search correctness.
+//   - Time forfeit fix (late 1.2): engine was losing ~75% of games on time in
+//     the gauntlet due to three compounding issues: (a) HARD_FACTOR=3.0 was
+//     too generous, (b) SAFETY_FACTOR=0.95 left only 5% headroom for OS
+//     jitter/GUI latency, (c) no fixed overhead buffer for move transmission.
+//     Fix: added OVERHEAD_MS (subtracted from remaining upfront), lowered
+//     HARD_FACTOR to 2.0 and SAFETY_FACTOR to 0.90, added 100ms grace buffer
+//     in should_stop() and a hard_limit floor guard. The hard_limit is also
+//     capped at remaining/3 (was /2) to prevent single-move time blowout.
 // =============================================================================
 
 #include "timeman.h"
 #include <algorithm>
-#include <chrono>    // std::chrono::steady_clock, duration_cast (also in timeman.h, explicit here for portability)
+#include <chrono>
+#include <cstdio>
+#include <iostream>
 
 // Global instance
 TimeManager TM;
@@ -35,28 +51,50 @@ TimeManager TM;
 // =============================================================================
 
 // Assumed number of moves remaining in the game when no movestogo is provided.
-// A simple fixed estimate — more sophisticated engines adapt this based on
-// game phase and material balance, but 30 is a reasonable average.
 constexpr int MOVES_TO_GO = 30;
 
 // Fraction of the base time budget used as the soft limit.
-// The engine aims to finish within soft_limit under normal conditions.
-// Set below 1.0 to leave headroom for dynamic extensions.
+// Below 1.0 to leave headroom for dynamic extensions.
 constexpr double SOFT_FACTOR = 0.6;
 
 // Multiplier from soft limit to hard limit.
-// The hard limit is how far extensions can push the actual search time.
-// 3.0 means the engine can spend up to 3x the base budget if needed.
-constexpr double HARD_FACTOR = 3.0;
+// Lowered from 3.0 to 2.0: the old value allowed extensions to triple the
+// budget, which combined with PV instability caused systematic time forfeits.
+constexpr double HARD_FACTOR = 2.0;
 
 // Safety margin applied to all computed limits.
-// Ensures we never use 100% of the allocated time, leaving a small buffer
-// for move transmission, GUI latency, and OS scheduling jitter.
-constexpr double SAFETY_FACTOR = 0.95;
+// Lowered from 0.95 to 0.90: the old 5% buffer was insufficient for GUI
+// latency + OS scheduling jitter, especially at low clock times.
+constexpr double SAFETY_FACTOR = 0.90;
+
+// Fixed overhead deducted from the remaining clock before all calculations.
+// Accounts for move transmission time, GUI round-trip, and OS scheduling
+// jitter. Applied upfront so every limit derived from remaining is safe.
+// 100ms is conservative -- typical UCI round-trip is 10-50ms.
+constexpr int OVERHEAD_MS = 100;
+
+// Grace buffer in should_stop(): stop OVERHEAD_MS before the hard limit.
+// Ensures the engine stops and sends bestmove before the GUI clock expires,
+// even if the last node batch takes longer than expected.
+constexpr int STOP_GRACE_MS = 100;
 
 // Minimum time budget per move in milliseconds.
-// Prevents the engine from spending 0ms on a move when the clock is critical.
 constexpr int MIN_TIME_MS = 10;
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+// Format milliseconds as h:mm:ss,ms for readability at long time controls.
+// Pure integer arithmetic -- no floating point, no allocations.
+static void format_time(char* buf, size_t sz, int64_t ms) {
+    int64_t s   = (ms / 1000) % 60;
+    int64_t m   = (ms / 60000) % 60;
+    int64_t h   =  ms / 3600000;
+    int64_t ms3 =  ms % 1000;
+    std::snprintf(buf, sz, "%lld:%02lld:%02lld,%03lld",
+                  (long long)h, (long long)m, (long long)s, (long long)ms3);
+}
 
 // =============================================================================
 // START
@@ -83,37 +121,54 @@ void TimeManager::start(Color side) {
     }
 
     // --- Normal clock management ---
-    int remaining = (side == WHITE) ? time_white : time_black;
-    int increment = (side == WHITE) ? inc_white  : inc_black;
+    int raw_remaining = (side == WHITE) ? time_white : time_black;
+    int increment     = (side == WHITE) ? inc_white  : inc_black;
 
-    if (remaining <= 0) {
-        // No clock information provided: fall back to a safe 1-second default
-        soft_limit_ms = 600;   // 600ms soft
-        hard_limit_ms = 1000;  // 1s hard
+    if (raw_remaining <= 0) {
+        soft_limit_ms = 600;
+        hard_limit_ms = 1000;
         return;
     }
 
+    // Subtract a fixed overhead before any calculation. This accounts for
+    // move transmission time, GUI round-trip latency, and OS scheduling
+    // jitter. All limits derived below are therefore safe even under load.
+    int remaining = std::max(raw_remaining - OVERHEAD_MS, MIN_TIME_MS);
+
     // Base formula: spread remaining time over expected moves left,
-    // then add most of the increment (it is replenished each move).
+    // then add most of the increment (replenished each move).
     int base_time = remaining / MOVES_TO_GO + increment * 3 / 4;
 
-    // Apply safety margin
+    // Apply safety margin and floor.
     base_time = int(base_time * SAFETY_FACTOR);
     base_time = std::max(base_time, MIN_TIME_MS);
 
-    // Hard cap on base_time: never plan to spend more than half the remaining
-    // time on a single move, even before extensions are applied.
-    base_time = std::min(base_time, remaining / 2);
+    // Hard cap: never plan more than 1/3 of remaining time on a single move.
+    // Tighter than the old /2 cap -- prevents single-move blowout at low clock.
+    base_time = std::min(base_time, remaining / 3);
 
-    // Soft limit: the normal target. Below the base to leave room for extensions.
+    // Soft limit: normal target, below base to leave room for extensions.
     soft_limit_ms = int(base_time * SOFT_FACTOR);
     soft_limit_ms = std::max(soft_limit_ms, MIN_TIME_MS);
 
-    // Hard limit: the absolute ceiling including any extensions.
-    // Capped at half the remaining time to prevent catastrophic time trouble.
+    // Hard limit: absolute ceiling including extensions.
+    // Capped at 1/3 of remaining (matching base_time cap).
+    // Hard >= soft always.
     hard_limit_ms = int(base_time * HARD_FACTOR);
-    hard_limit_ms = std::min(hard_limit_ms, remaining / 2);
-    hard_limit_ms = std::max(hard_limit_ms, soft_limit_ms);  // Hard >= soft always
+    hard_limit_ms = std::min(hard_limit_ms, remaining / 3);
+    hard_limit_ms = std::max(hard_limit_ms, soft_limit_ms);
+
+    char t_soft[32], t_hard[32];
+    format_time(t_soft, sizeof(t_soft), soft_limit_ms);
+    format_time(t_hard, sizeof(t_hard), hard_limit_ms);
+
+    std::cout << "info string TM: allocated "
+              << t_soft << " soft / "
+              << t_hard << " hard"
+              << " (clock " << raw_remaining << "ms"
+              << ", effective " << remaining << "ms"
+              << ", inc " << increment << "ms)\n"
+              << std::flush;
 }
 
 // =============================================================================
@@ -134,7 +189,9 @@ int TimeManager::elapsed_ms() const {
 bool TimeManager::should_stop() const {
     if (stop)     return true;   // External abort from UCI "stop" command
     if (infinite) return false;  // Never stop on time during infinite search
-    return elapsed_ms() >= hard_limit_ms;
+    // STOP_GRACE_MS before the hard limit: ensures bestmove is sent before
+    // the GUI clock expires, even if the last 2048-node batch is slow.
+    return elapsed_ms() >= hard_limit_ms - STOP_GRACE_MS;
 }
 
 // =============================================================================
@@ -162,9 +219,29 @@ bool TimeManager::soft_stop() const {
 //   - Score dropped significantly: extend_time(1.25)
 // Both can apply in the same iteration (multiplicative effect).
 
-void TimeManager::extend_time(double factor) {
+void TimeManager::extend_time(double factor, const char* reason) {
+    // No-op during infinite search -- limits are the sentinel value (1<<28),
+    // there is nothing meaningful to extend or report.
+    if (infinite) return;
+
+    int old_soft  = soft_limit_ms;
     soft_limit_ms = int(soft_limit_ms * factor);
-    soft_limit_ms = std::min(soft_limit_ms, hard_limit_ms);  // Never exceed hard
+    soft_limit_ms = std::min(soft_limit_ms, hard_limit_ms);
+    int headroom  = hard_limit_ms - soft_limit_ms;
+
+    char t_now[32], t_old[32], t_new[32], t_hard[32], t_head[32];
+    format_time(t_now,  sizeof(t_now),  elapsed_ms());
+    format_time(t_old,  sizeof(t_old),  old_soft);
+    format_time(t_new,  sizeof(t_new),  soft_limit_ms);
+    format_time(t_hard, sizeof(t_hard), hard_limit_ms);
+    format_time(t_head, sizeof(t_head), headroom);
+
+    std::cout << "info string TM: extend x" << factor;
+    if (reason && reason[0]) std::cout << " (" << reason << ")";
+    std::cout << " -- soft " << t_old << " -> " << t_new
+              << " (hard " << t_hard << ", headroom " << t_head << ")"
+              << " [" << t_now << "]\n"
+              << std::flush;
 }
 
 // =============================================================================

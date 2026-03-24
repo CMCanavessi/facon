@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-11 23:49
 // tt.cpp — Transposition Table implementation
 // =============================================================================
 
@@ -28,22 +29,24 @@ static uint64_t prev_power_of_two(uint64_t n) {
 // =============================================================================
 
 TranspositionTable::TranspositionTable(int mb) {
-    resize(mb);
+    resize(mb, /*silent=*/true);
 }
 
-void TranspositionTable::resize(int mb) {
+void TranspositionTable::resize(int mb, bool silent) {
     uint64_t bytes   = uint64_t(mb) * 1024 * 1024;
     uint64_t entries = bytes / sizeof(TTEntry);
 
     size_ = prev_power_of_two(entries);
     mask_ = size_ - 1;
+    mb_   = mb;
 
     table_.assign(size_, TTEntry{});
 
-    // Diagnostic output goes to stderr — stdout is reserved for UCI protocol
-    std::cerr << "TT: " << mb << " MB ("
-              << size_ << " entries, "
-              << sizeof(TTEntry) << " bytes each)\n";
+    // Diagnostic output goes to stderr — stdout is reserved for UCI protocol.
+    // Suppressed during initial construction (silent=true) because global
+    // objects are constructed before main() runs, before the banner is printed.
+    if (!silent)
+        print_info();
 }
 
 void TranspositionTable::clear() {
@@ -85,6 +88,17 @@ bool TranspositionTable::probe(uint64_t hash, TTEntry& out) const {
 
     out = entry;
     return true;
+}
+
+// =============================================================================
+// PRINT INFO
+// =============================================================================
+
+void TranspositionTable::print_info() const {
+    std::cerr << "Setting Transposition Table (Hash) size to "
+              << mb_ << " MB ("
+              << size_ << " entries, "
+              << sizeof(TTEntry) << " bytes each)\n";
 }
 
 // =============================================================================

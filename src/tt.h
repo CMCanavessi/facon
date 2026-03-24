@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-12 12:30
 // tt.h — Transposition Table
 //
 // A hash table that caches search results to avoid re-searching positions
@@ -7,6 +8,27 @@
 // Uses a fixed-size array. Collision resolution strategy: always overwrite,
 // but preserve the stored move if the new entry has none (move preservation).
 // Each slot holds exactly one TTEntry.
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation: Zobrist-indexed fixed-size hash table, always-
+//     replace strategy, probe()/store() interface, configurable size via
+//     UCI setoption Hash.
+//
+// Facon 1.1 -- Herrumbre
+//   - Removed probe_move(): dead code. The root no longer relies on TT probes
+//     for bestmove -- root_best_move_ is set directly in negamax(). Keeping
+//     an unused public method that exposes internal table access was
+//     unnecessary and misleading.
+//
+// Facon 1.2 -- Rojo Vivo
+//   - Silent constructor: TT is a global object initialized before main().
+//     The constructor now calls resize(mb, silent=true) so no output is
+//     emitted during static initialization. print_info() is called explicitly
+//     from main() after the banner, gated behind isatty().
+//   - print_info(): new method that emits the TT size message on demand,
+//     replacing the output that was previously in the constructor.
+//   - resize(mb, silent=false): added silent parameter so the constructor
+//     can suppress output while callers from setoption still get feedback.
 // =============================================================================
 
 #pragma once
@@ -48,8 +70,10 @@ public:
     // Create a TT with the given size in megabytes (default: 16 MB)
     explicit TranspositionTable(int mb = 16);
 
-    // Resize and clear the table (used by the UCI "setoption Hash" command)
-    void resize(int mb);
+    // Resize and clear the table (used by the UCI "setoption Hash" command).
+    // Pass silent=true to suppress the diagnostic message (used internally
+    // during construction, before the engine banner is printed).
+    void resize(int mb, bool silent = false);
 
     // Clear all entries (call at the start of a new game)
     void clear();
@@ -68,10 +92,15 @@ public:
     // Used for the UCI "info hashfull" output.
     int hashfull() const;
 
+    // Print the current TT configuration to stderr.
+    // Called from main() after the engine banner so output appears in order.
+    void print_info() const;
+
 private:
     std::vector<TTEntry> table_;  // Flat array of entries
     uint64_t             mask_;   // Bitmask for index computation (size - 1)
     uint64_t             size_;   // Number of entries (always a power of two)
+    int                  mb_;     // Current size in MB (for print_info())
 
     // Map a Zobrist hash to a table index using bitmasking (fast modulo)
     inline uint64_t index(uint64_t hash) const { return hash & mask_; }

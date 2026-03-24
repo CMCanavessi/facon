@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-19 00:00
 // search.h — Search engine declarations
 //
 // Implements iterative deepening with negamax alpha-beta search and
@@ -21,6 +22,26 @@
 //     whenever a new best is found at the root node. We never do TT early
 //     returns at ply 0, so this is always set from the actual move loop —
 //     never from a potentially stale or collided TT entry.
+//
+// Facon 1.2 — Rojo Vivo
+//   - Null Move Pruning (NMP): if the side to move can pass without moving
+//     and the resulting reduced-depth search still exceeds beta, the position
+//     is likely so good that a cutoff is safe. Controlled by NMP_MIN_DEPTH
+//     and NMP_REDUCTION. Disabled in zugzwang-prone positions (pawnless
+//     endings), in check, and at the root.
+//   - Triangular PV array: tracks the full principal variation at each ply
+//     using a MAX_PLY x MAX_PLY table. Replaces single-move root PV output
+//     with the full line. Members: pv_table_ and pv_length_.
+//   - Verbosity: currmove output at the root for each move explored;
+//     "new best" info string when the best move changes relative to the
+//     PREVIOUS iteration (guarded by prev_best_move_ member -- without
+//     this, alpha resetting each depth would fire on every iteration);
+//     time formatted as h:mm:ss,ms; heartbeat every 5 minutes as two
+//     separate lines (standard info + info string) so Arena shows both.
+//     Heartbeat uses last_heartbeat_ms_ (NOT last_output_ms_) so that
+//     high-frequency currmove lines cannot suppress it during long iterations.
+//     new-best lines DO update last_heartbeat_ms_ (they are substantive
+//     output, unlike currmove lines which carry no status info).
 // =============================================================================
 
 #pragma once
@@ -49,10 +70,11 @@ struct SearchResult {
 // Counters updated during search, used for UCI info output.
 
 struct SearchStats {
-    uint64_t nodes    = 0;  // Total nodes visited (negamax + quiescence)
+    uint64_t nodes    = 0;  // Nodes visited in negamax() only (not quiescence)
     uint64_t tt_hits  = 0;  // Transposition table hits
-    uint64_t qnodes   = 0;  // Quiescence search nodes
+    uint64_t qnodes   = 0;  // Nodes visited in quiescence()
     int      seldepth = 0;  // Maximum depth reached including quiescence
+    // Note: use (nodes + qnodes) for total node count and NPS reporting.
 };
 
 // =============================================================================
@@ -91,15 +113,86 @@ private:
     // are irrelevant and can mislead move ordering.
     Move killers_[MAX_PLY][2];
 
+    // Triangular PV array: stores the principal variation at each ply.
+    // pv_table_[ply] holds the PV line from that ply to the end of the search.
+    // pv_length_[ply] is the number of valid moves in that line.
+    // The table is triangular because the line at ply N can be at most
+    // (MAX_PLY - N) moves long — deeper plies have shorter remaining lines.
+    Move pv_table_[MAX_PLY][MAX_PLY];
+    int  pv_length_[MAX_PLY];
+
+    // -------------------------------------------------------------------------
+    // NULL MOVE PRUNING PARAMETERS
+    // -------------------------------------------------------------------------
+
+    // Minimum remaining depth to attempt a null move. Below this threshold
+    // the cost of the reduced search outweighs the expected pruning benefit.
+    static constexpr int NMP_MIN_DEPTH   = 3;
+
+    // Depth reduction applied to the null move search (R in standard NMP).
+    // The null move search runs at (depth - 1 - NMP_REDUCTION).
+    // A value of 3 is aggressive but standard for engines without LMR.
+    static constexpr int NMP_REDUCTION   = 3;
+
+    // -------------------------------------------------------------------------
+    // VERBOSITY / OBSERVABILITY
+    // -------------------------------------------------------------------------
+
+    // Heartbeat interval in milliseconds. If no output has been emitted for
+    // this long, a status line is printed to stdout. Only relevant at very
+    // long time controls (VVLTC) where a single iteration can run for many
+    // minutes — allows distinguishing a live deep search from a crash.
+    static constexpr int64_t HEARTBEAT_INTERVAL_MS = 300000;  // 5 minutes
+
+    // Timestamp of the last output line of ANY kind. Updated after every
+    // stdout write including currmove and new-best. Not used by the heartbeat
+    // check (see last_heartbeat_ms_ below).
+    int64_t last_output_ms_ = 0;
+
+    // Timestamp of the last VISIBLE output. The heartbeat fires when
+    // (now - last_heartbeat_ms_) >= HEARTBEAT_INTERVAL_MS, and exists to
+    // prevent long silent stretches in the operator's log. Updated by:
+    //   - end-of-iteration UCI info lines (go())
+    //   - the heartbeat itself (negamax())
+    //   - new-best info strings (negamax()) — these appear as text lines
+    //     in the GUI log, so they constitute visible activity that resets
+    //     the silence counter.
+    // NOT updated by currmove lines — GUIs consume currmove internally
+    // to update a dedicated panel, but it never appears in the text log.
+    // The operator sees nothing from currmove, so it cannot be treated as
+    // a sign of activity from their perspective.
+    int64_t last_heartbeat_ms_ = 0;
+
+    // Depth of the iteration currently in progress. Set at the top of each
+    // iteration in go(). Used in heartbeat messages and currmove output so
+    // the operator knows which depth is being searched.
+    int current_depth_ = 0;
+
+    // Total number of legal moves at the root for the current iteration.
+    // Set once per iteration before the move loop. Used to format currmove
+    // output as "move N / total" for context.
+    int root_move_count_ = 0;
+
+    // Best move from the previous completed iteration of iterative deepening.
+    // Used by negamax() at ply 0 to suppress the "new best" info string when
+    // the same move is re-confirmed at a new depth (alpha resets to -INFINITY
+    // each iteration, so the first alpha-raise would fire every depth without
+    // this guard). Set at the end of each completed iteration in go().
+    Move prev_best_move_ = MOVE_NONE;
+
     // -------------------------------------------------------------------------
     // CORE SEARCH FUNCTIONS
     // -------------------------------------------------------------------------
 
     // Negamax alpha-beta search.
     // Returns the score from the perspective of the side to move.
-    //   ply   = distance from the root (0 at root, increases with each move)
-    //   depth = remaining depth to search (decreases toward 0)
-    Score negamax(Board& board, Score alpha, Score beta, int depth, int ply);
+    //   ply     = distance from the root (0 at root, increases with each move)
+    //   depth   = remaining depth to search (decreases toward 0)
+    //   do_null = whether null move pruning is allowed at this node.
+    //             Set to false for the node immediately after a null move to
+    //             prevent two consecutive null moves (infinite loop / unsound pruning).
+    Score negamax(Board& board, Score alpha, Score beta, int depth, int ply,
+                  bool do_null = true);
 
     // Quiescence search: called at depth=0 to resolve tactical sequences.
     // Searches captures only until the position is "quiet".
@@ -126,7 +219,6 @@ private:
     // Does nothing if the move is already in slot 0.
     // Otherwise shifts slot 0 to slot 1 and stores the new move in slot 0.
     void store_killer(Move m, int ply);
-
 
 };
 

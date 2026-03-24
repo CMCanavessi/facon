@@ -1,5 +1,16 @@
 # =============================================================================
+# Last modified: 2026-03-11 23:49
 # CMakeLists.txt — Build system for the Facón chess engine
+#
+# Changelog:
+#   1.2 — Replace global -static flag with selective static linking on Windows.
+#         The old -static flag triggered Windows Defender false positives due
+#         to cryptominer heuristics applied to fully-static PE binaries. The
+#         new approach statically links only the runtime libraries (libgcc,
+#         libstdc++, winpthread) while leaving the rest dynamic — no behavior
+#         change, no false positives, Linux build unaffected.
+#         Added src/version.rc: Windows version resource with FileDescription
+#         and CompanyName, shows metadata in Explorer -> Properties -> Details.
 #
 # QUICK START
 # -----------
@@ -25,7 +36,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(facon VERSION 1.1 LANGUAGES CXX)
+project(facon VERSION 1.2 LANGUAGES CXX)
 
 # =============================================================================
 # OPTIONS
@@ -68,7 +79,7 @@ set(SOURCES
 )
 
 add_executable(facon ${SOURCES})
-set_target_properties(facon PROPERTIES OUTPUT_NAME "facon-1.1")
+set_target_properties(facon PROPERTIES OUTPUT_NAME "facon-1.2")
 
 # =============================================================================
 # COMPILER FLAGS
@@ -158,14 +169,23 @@ if(WIN32)
         NOMINMAX                  # Prevent Windows.h from defining min/max macros
     )
 
-    # Static linking: the .exe runs on any Windows machine without extra DLLs
+    # Selective static linking: statically link only the C/C++ and pthread
+    # runtimes so the .exe runs without extra DLLs on any Windows machine.
+    # The old -static global flag caused Windows Defender false positives
+    # (cryptominer heuristic triggered by fully-static PE binaries). Selective
+    # linking avoids this with no impact on performance or compatibility.
+    # Linux build is unaffected — this block is WIN32-only.
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_link_options(facon PRIVATE
-            -static
             -static-libgcc
             -static-libstdc++
+            -Wl,-Bstatic,-lwinpthread,-Bdynamic
         )
     endif()
+
+    # Windows version resource: shows metadata in Explorer -> Properties -> Details.
+    # FileDescription, CompanyName, and version fields are defined in version.rc.
+    target_sources(facon PRIVATE src/version.rc)
 endif()
 
 # =============================================================================

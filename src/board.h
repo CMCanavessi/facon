@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-12 12:30
 // board.h — Chess board state representation
 //
 // The Board struct holds the complete state of a chess position and provides
@@ -187,6 +188,11 @@ struct Board {
 
     // Returns true if the move is legal (does not leave our king in check)
     bool is_legal(Move m) const;
+
+    // Convert a move to Standard Algebraic Notation (SAN).
+    // Requires board state for piece type, disambiguation, and check detection.
+    // Examples: "e4", "Nf3", "Bxd5", "O-O", "e8=Q+", "Rxd1#"
+    std::string move_to_san(Move m) const;
 
     // Returns true if the current position has occurred before in the game
     // history. Used to detect draws by threefold repetition.

@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-03-13 00:00
 // timeman.h — Time management
 //
 // Decides how much time to spend on the current move based on the remaining
@@ -6,16 +7,25 @@
 //
 // The search calls should_stop() periodically and stops when time is up.
 //
-// Facon 1.1 — Herrumbre
+// Facon 1.1 -- Herrumbre
 //   - Soft/hard limit model replaces the single fixed time budget:
 //       soft_limit: the target time. If a completed iteration exceeds this,
 //                   the search stops normally. Can be extended dynamically.
 //       hard_limit: the absolute maximum. The search stops immediately when
 //                   this is exceeded, even mid-iteration.
-//   - Dynamic extension: the soft limit is stretched when the search detects
-//     instability (PV move changed) or a score drop between iterations.
-//     This allows the engine to spend more time on difficult positions and
-//     less on clear ones, rather than always using the same fixed budget.
+//   - Dynamic extension (extend_time): the soft limit is stretched when the
+//     search detects instability (PV move changed) or a score drop between
+//     iterations. Allows more time on difficult positions.
+//
+// Facon 1.2 -- Rojo Vivo
+//   - extend_time() reason parameter: accepts optional label, emits
+//     "info string TM extend xF (reason) -- soft Xms -> Yms [h:mm:ss,ms]".
+//   - start() allocation report: emits soft/hard limits and effective clock
+//     on each call, for real-time TM diagnostics.
+//   - Time forfeit fix: OVERHEAD_MS subtracted from remaining upfront;
+//     HARD_FACTOR lowered 3.0->2.0; SAFETY_FACTOR lowered 0.95->0.90;
+//     hard_limit capped at remaining/3 (was /2); should_stop() returns true
+//     STOP_GRACE_MS (100ms) before hard_limit to guarantee bestmove delivery.
 // =============================================================================
 
 #pragma once
@@ -102,7 +112,8 @@ struct TimeManager {
     // Extend the soft limit by a given factor (e.g. 1.5 = 50% more time).
     // Called when the search detects PV instability or a score drop.
     // The extended limit is capped at the hard limit to prevent time trouble.
-    void extend_time(double factor);
+    // 'reason' is a short human-readable label emitted in the info string.
+    void extend_time(double factor, const char* reason = "");
 
     // Reset all configuration fields to their defaults.
     // Call before populating with a new "go" command's parameters.

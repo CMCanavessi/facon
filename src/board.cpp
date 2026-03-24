@@ -1,8 +1,39 @@
 // =============================================================================
+// Last modified: 2026-03-12 12:30
 // board.cpp — Board state implementation: FEN parsing, make/unmake, queries
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation: FEN parsing, make_move()/unmake_move() with full
+//     state restore, Zobrist hashing (incremental), draw detection (repetition
+//     and 50-move rule), is_legal() via board copy, and board display.
+//
+// Facon 1.1 -- Herrumbre
+//   - is_legal() piece ownership check: verify the from-square contains a piece
+//     belonging to the side to move before the expensive board copy. Catches
+//     ghost moves from stale TT entries (wrong piece, wrong color, or hash
+//     collision) that previously passed the legality check silently.
+//
+// Facon 1.2 -- Rojo Vivo
+//   - Fix unmake_move() hash corruption: hash = st.hash was placed before the
+//     piece operations (move_piece, put_piece, remove_piece), each of which
+//     XOR the hash as a side effect. The restored hash was immediately
+//     re-corrupted. Fixed by moving hash = st.hash to the last line of
+//     unmake_move(), after all piece operations. Latent bug since 1.0 --
+//     affected TT hit rates, repetition detection, and PV display.
+//   - Fix make_null_move() full_move_number corruption: make_null_move() never
+//     incremented full_move_number, but unmake_null_move() decremented it when
+//     side_to_move == BLACK after the flip. Every null move by Black produced
+//     an unmatched decrement. Fixed: added the symmetric increment in
+//     make_null_move() after the side flip.
+//   - move_to_san(): converts a Move to Standard Algebraic Notation with full
+//     disambiguation (file, rank, or both when needed), castling notation
+//     (O-O / O-O-O), promotion suffix, and check/checkmate markers (+ / #).
+//     Used by search.cpp to emit the "new best" info string in human-readable
+//     form. Requires movegen.h for generate_all_moves() (disambiguation).
 // =============================================================================
 
 #include "board.h"
+#include "movegen.h"  // MoveList, generate_all_moves — needed by move_to_san()
 #include <sstream>
 #include <iostream>
 #include <iomanip>
@@ -259,7 +290,8 @@ Bitboard Board::attackers_to(Square s, Color c) const {
 }
 
 // Returns a bitboard of ALL squares attacked by color 'c'.
-// Currently unused in search but available for future use (king safety).
+// Used in king safety evaluation (eval.cpp). Available for future use
+// in mobility scoring and other positional terms.
 Bitboard Board::attacked_by(Color c) const {
     Bitboard result = 0;
     Bitboard occ    = occupancy();
@@ -405,15 +437,13 @@ void Board::unmake_move(Move m) {
     Square   to   = to_sq(m);
     MoveType mt   = move_type(m);
 
-    // Restore all irreversible state from the history entry
-    ep_square       = st.ep_square;
-    castling_rights = st.castling_rights;
-    half_move_clock = st.half_move_clock;
-    hash            = st.hash;
-
     if (side_to_move == BLACK)
         full_move_number--;
 
+    // Restore piece positions first (move_piece/put_piece/remove_piece also
+    // XOR the hash incrementally, but we override with st.hash below so their
+    // hash side-effects are discarded — only the bitboard/piece_on updates
+    // from these calls matter here).
     if (mt == NORMAL) {
         move_piece(*this, to, from);
         if (st.captured_piece != NO_PIECE)
@@ -437,6 +467,15 @@ void Board::unmake_move(Move m) {
         move_piece(*this, to, from);
         move_piece(*this, rook_to, rook_from);
     }
+
+    // Restore all irreversible state from the history entry.
+    // hash is restored LAST so that the piece-operation XORs above (which
+    // also touch hash incrementally) are completely overridden — the saved
+    // hash is always correct and requires no manual reversal.
+    ep_square       = st.ep_square;
+    castling_rights = st.castling_rights;
+    half_move_clock = st.half_move_clock;
+    hash            = st.hash;
 }
 
 // =============================================================================
@@ -460,6 +499,12 @@ void Board::make_null_move() {
     }
     side_to_move = ~side_to_move;
     hash ^= Zobrist::side_to_move;
+
+    // Mirror make_move(): full move number increments after Black's move.
+    // Without this, unmake_null_move() decrements without a prior increment
+    // whenever Black makes the null move, corrupting the counter.
+    if (side_to_move == WHITE) full_move_number++;
+
     half_move_clock++;
 }
 
@@ -524,6 +569,103 @@ bool Board::is_repetition() const {
             return true;
     }
     return false;
+}
+
+// =============================================================================
+// MOVE TO SAN
+// =============================================================================
+// Converts a move to Standard Algebraic Notation.
+// Requires the board state BEFORE the move is made.
+//
+// Format rules:
+//   Castling:    "O-O" or "O-O-O"
+//   Pawn push:   "e4", "e8=Q"
+//   Pawn capture:"exd5", "exd8=Q"
+//   Piece move:  "Nf3", "Bxd5" — with disambiguation if needed
+//   Check:       appended "+"
+//   Checkmate:   appended "#"
+//
+// Disambiguation: if two pieces of the same type can both reach the
+// destination square legally, we append:
+//   - the from-file if the files differ ("Rae1" vs "Rfe1")
+//   - the from-rank if the files are the same ("R1e3" vs "R3e3")
+//   - both if files and ranks both differ (rare, only in triple-ambiguity)
+
+std::string Board::move_to_san(Move m) const {
+    Square    from = from_sq(m);
+    Square    to   = to_sq(m);
+    MoveType  mt   = move_type(m);
+    PieceType pt   = type_of(piece_on[from]);
+    bool      cap  = (piece_on[to] != NO_PIECE) || (mt == EN_PASSANT);
+
+    std::string san;
+
+    // --- Castling ---
+    if (mt == CASTLING)
+        return (to > from) ? "O-O" : "O-O-O";
+
+    // --- Pawn ---
+    if (pt == PAWN) {
+        if (cap) {
+            san += char('a' + file_of(from));
+            san += 'x';
+        }
+        san += char('a' + file_of(to));
+        san += char('1' + rank_of(to));
+        if (mt == PROMOTION) {
+            san += '=';
+            const char promo_chars[] = "NBRQ";
+            san += promo_chars[promotion_type(m) - KNIGHT];
+        }
+    }
+    // --- Piece ---
+    else {
+        static const char piece_char[] = " PNBRQK";
+        san += piece_char[pt];
+
+        // Disambiguation: find other legal moves by the same piece type to 'to'
+        bool need_file = false;
+        bool need_rank = false;
+        MoveList all;
+        generate_all_moves(*this, all);
+        for (int i = 0; i < all.count; i++) {
+            Move   other     = all.moves[i];
+            Square other_from = from_sq(other);
+            if (other_from == from)         continue;  // same piece
+            if (to_sq(other) != to)         continue;  // different destination
+            if (type_of(piece_on[other_from]) != pt) continue;  // different type
+            if (!is_legal(other))           continue;  // illegal move
+
+            // Another piece of the same type can reach 'to' legally
+            if (file_of(other_from) != file_of(from))
+                need_file = true;   // files differ: disambiguate by file
+            else
+                need_rank = true;   // same file: disambiguate by rank
+        }
+
+        if (need_file) san += char('a' + file_of(from));
+        if (need_rank) san += char('1' + rank_of(from));
+        if (cap)       san += 'x';
+        san += char('a' + file_of(to));
+        san += char('1' + rank_of(to));
+    }
+
+    // --- Check / Checkmate ---
+    // Make the move on a copy and check if the opponent's king is in check.
+    Board copy = *this;
+    copy.make_move(m);
+    if (copy.in_check()) {
+        // Checkmate if no legal responses exist
+        MoveList responses;
+        generate_all_moves(copy, responses);
+        bool has_legal = false;
+        for (int i = 0; i < responses.count; i++) {
+            if (copy.is_legal(responses.moves[i])) { has_legal = true; break; }
+        }
+        san += has_legal ? '+' : '#';
+    }
+
+    return san;
 }
 
 // =============================================================================

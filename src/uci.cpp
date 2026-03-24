@@ -1,5 +1,22 @@
 // =============================================================================
+// Last modified: 2026-03-12 12:30
 // uci.cpp — UCI protocol implementation
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation: command dispatch loop, position parsing (startpos
+//     and FEN with move list), go command (wtime/btime/winc/binc/movetime/
+//     infinite/depth), setoption Hash, parse_move() via move generation.
+//
+// Facon 1.2 -- Rojo Vivo
+//   - UCI threading: cmd_go() now launches the search in a dedicated
+//     std::thread (search_thread_) and returns immediately. The loop can
+//     continue reading stdin while the engine is searching. cmd_stop() sets
+//     TM.stop and joins the thread, which unwinds cleanly through the
+//     abort_search_ flag in Search. Previously "stop" was never received
+//     because cmd_go() blocked the entire UCI loop.
+//   - isatty()-gated prompt: the interactive "> " prompt is emitted to stderr
+//     only when stdin is a terminal (IS_INTERACTIVE()). Suppressed when
+//     launched by Arena, CuteChess, or fastchess to keep stdout clean.
 // =============================================================================
 
 #include "uci.h"
@@ -10,6 +27,14 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
+#ifdef _WIN32
+#  include <io.h>
+#  define IS_INTERACTIVE() (_isatty(_fileno(stdin)))
+#else
+#  include <unistd.h>
+#  define IS_INTERACTIVE() (isatty(fileno(stdin)))
+#endif
 
 // Global instance
 UCI Uci;
@@ -63,7 +88,7 @@ Move UCI::parse_move(const std::string& str) {
 // =============================================================================
 
 void UCI::cmd_uci() {
-    std::cout << "id name Facon 1.1 - Herrumbre\n";
+    std::cout << "id name Facon 1.2 - Rojo Vivo\n";
     std::cout << "id author Carlos M. Canavessi\n";
     std::cout << "\n";
     std::cout << "option name Hash type spin default 16 min 1 max 1024\n";
@@ -145,9 +170,22 @@ void UCI::cmd_go(std::istringstream& ss) {
         // "movestogo" is ignored — we always assume 30 moves remaining
     }
 
-    SearchResult result = Searcher.go(board_);
-    std::cout << "bestmove " << move_to_uci(result.best_move) << "\n"
-              << std::flush;
+    // If a previous search thread is still joinable (e.g. the GUI sent "go"
+    // without a prior "stop"), join it before launching a new one.
+    if (search_thread_.joinable())
+        search_thread_.join();
+
+    // Launch the search in a dedicated thread so the UCI loop can keep
+    // reading stdin. The thread prints "bestmove" when the search finishes.
+    // We capture board_ by value so the search works on a stable copy —
+    // the UCI loop must not modify board_ while the search is running
+    // (the GUI is required by the UCI spec to send "stop" before "position").
+    Board search_board = board_;
+    search_thread_ = std::thread([search_board]() mutable {
+        SearchResult result = Searcher.go(search_board);
+        std::cout << "bestmove " << move_to_uci(result.best_move) << "\n"
+                  << std::flush;
+    });
 }
 
 // =============================================================================
@@ -155,7 +193,14 @@ void UCI::cmd_go(std::istringstream& ss) {
 // =============================================================================
 
 void UCI::cmd_stop() {
+    // Signal the search to abort. The search checks TM.should_stop() every
+    // 2048 nodes and sets abort_search_, which unwinds the recursion cleanly.
     TM.stop = true;
+
+    // Wait for the search thread to finish and print "bestmove" before we
+    // return. This ensures the GUI always gets a response to its "stop".
+    if (search_thread_.joinable())
+        search_thread_.join();
 }
 
 // =============================================================================
@@ -198,10 +243,15 @@ void UCI::cmd_display() {
 void UCI::loop() {
     board_.set_startpos();
 
+    if (IS_INTERACTIVE()) std::cerr << "> " << std::flush;
+
     std::string line, token;
 
     while (std::getline(std::cin, line)) {
-        if (line.empty()) continue;
+        if (line.empty()) {
+            if (IS_INTERACTIVE()) std::cerr << "> " << std::flush;
+            continue;
+        }
 
         std::istringstream ss(line);
         ss >> token;
@@ -214,6 +264,13 @@ void UCI::loop() {
         else if (token == "stop")       cmd_stop();
         else if (token == "setoption")  cmd_setoption(ss);
         else if (token == "d")          cmd_display();
-        else if (token == "quit")       break;
+        else if (token == "quit") {
+            TM.stop = true;
+            if (search_thread_.joinable())
+                search_thread_.join();
+            break;
+        }
+
+        if (IS_INTERACTIVE()) std::cerr << "> " << std::flush;
     }
 }
