@@ -141,7 +141,8 @@ facon/
 ├── docs/
 │   ├── v1.0.md         — Technical documentation for v1.0
 │   ├── v1.1.md         — Technical documentation for v1.1
-│   └── v1.2.md         — Technical documentation for v1.2
+│   ├── v1.2.md         — Technical documentation for v1.2
+│   └── v1.3.md         — Technical documentation for v1.3
 ├── CMakeLists.txt
 ├── CHANGELOG.md
 └── README.md
