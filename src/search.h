@@ -1,47 +1,58 @@
 // =============================================================================
-// Last modified: 2026-03-19 00:00
+// Last modified: 2026-04-06 00:06
 // search.h — Search engine declarations
 //
 // Implements iterative deepening with negamax alpha-beta search and
 // quiescence search. Uses the transposition table and time manager.
 //
 // Facon 1.1 — Herrumbre
-//   - Killer move heuristic: two quiet moves per ply that caused a beta
-//     cutoff are stored and tried before other quiet moves in subsequent
-//     searches of the same ply. Improves ordering in quiet positions without
-//     the overhead of a full history table.
-//   - seldepth tracking: maximum depth reached including quiescence search,
-//     reported in the UCI info line each iteration.
-//   - Illegal PV move fix: is_legal() in board.cpp now checks piece ownership
-//     on the from-square before doing the expensive board copy. This catches
-//     ghost moves from stale TT entries (wrong piece, wrong color, or hash
-//     collision) that previously passed the legality check silently.
-//   - Dynamic time management: uses soft_stop() after each iteration and
-//     calls TM.extend_time() when PV instability or score drops are detected.
-//   - root_best_move_: best move at ply 0 is saved directly in negamax()
-//     whenever a new best is found at the root node. We never do TT early
-//     returns at ply 0, so this is always set from the actual move loop —
-//     never from a potentially stale or collided TT entry.
+//   - Killer move heuristic, seldepth tracking, abort flag, root_best_move_,
+//     dynamic time management (soft_stop + extend_time).
 //
 // Facon 1.2 — Rojo Vivo
-//   - Null Move Pruning (NMP): if the side to move can pass without moving
-//     and the resulting reduced-depth search still exceeds beta, the position
-//     is likely so good that a cutoff is safe. Controlled by NMP_MIN_DEPTH
-//     and NMP_REDUCTION. Disabled in zugzwang-prone positions (pawnless
-//     endings), in check, and at the root.
-//   - Triangular PV array: tracks the full principal variation at each ply
-//     using a MAX_PLY x MAX_PLY table. Replaces single-move root PV output
-//     with the full line. Members: pv_table_ and pv_length_.
-//   - Verbosity: currmove output at the root for each move explored;
-//     "new best" info string when the best move changes relative to the
-//     PREVIOUS iteration (guarded by prev_best_move_ member -- without
-//     this, alpha resetting each depth would fire on every iteration);
-//     time formatted as h:mm:ss,ms; heartbeat every 5 minutes as two
-//     separate lines (standard info + info string) so Arena shows both.
-//     Heartbeat uses last_heartbeat_ms_ (NOT last_output_ms_) so that
-//     high-frequency currmove lines cannot suppress it during long iterations.
-//     new-best lines DO update last_heartbeat_ms_ (they are substantive
-//     output, unlike currmove lines which carry no status info).
+//   - Null Move Pruning (NMP): NMP_MIN_DEPTH, NMP_REDUCTION.
+//   - Triangular PV array: pv_table_, pv_length_.
+//   - Verbosity: currmove, new-best SAN, heartbeat (last_heartbeat_ms_).
+//
+// Facon 1.3 — Yunque
+//   - depth == 0: quiescence entry condition changed from <= to == as LMR
+//     prerequisite. All reduction call sites use std::max(0, reduced_depth).
+//   - EXTENSION_FULL_DEPTH: depth at which TM extensions apply their full
+//     factor. Below this, the quadratic scaling in go() makes them near-zero.
+//     Calibrated from 1.2 VVLTC showcase data (avg depth 17.0).
+//   - stable_iters_: counts consecutive iterations where PV move and score
+//     are both stable. Drives the easy move reduction in go().
+//   - LMR (Late Move Reductions): moves searched after the first LMR_MIN_MOVES
+//     legal moves at depth >= LMR_MIN_DEPTH are searched at reduced depth if
+//     they are quiet and not in check. Re-searched at full depth if they raise
+//     alpha. Constants: LMR_MIN_DEPTH=3, LMR_MIN_MOVES=3, LMR_DIVISOR=2.25.
+//   - History heuristic: quiet moves that cause a beta cutoff increment
+//     history_[color][from][to] by depth^2. Scores replace ORDER_QUIET=0
+//     in move ordering, improving LMR accuracy. Reset each search.
+//   - Aspiration windows: the ID loop searches with a narrow window around
+//     the previous iteration's score instead of (-INFINITE, +INFINITE). On
+//     fail-low or fail-high, the window widens on the failing side and the
+//     search repeats. Applied from depth >= 4. ASP_WINDOW=50cp initial width.
+//
+// Facon 1.3 — Yunque (post-gauntlet fixes)
+//   - mate_reduction_applied_: one-shot guard so reduce_time("mate found")
+//     fires at most once per search. Without it, is_mate_score() is true on
+//     every iteration after a mate is found, applying x0.05 repeatedly and
+//     collapsing the soft limit exponentially (x0.05^N).
+//   - Complex position TM path: extend_time() now accepts a depth parameter.
+//     When depth >= EMERGENCY_DEPTH (25, defined in timeman.cpp) and new_soft
+//     would exceed the hard limit, hard is raised to match soft instead of
+//     capping soft. Both limits rise together on subsequent extensions, capped
+//     at 50% of raw remaining clock. Only triggered by real instability (a
+//     stable position at depth 25+ would have fired easy-move reduction first).
+//     EMERGENCY_DEPTH removed from search.h — it is a TM internal constant.
+//   - Aspiration window fail-low fix: beta_asp is no longer modified on a
+//     fail-low. The old "beta_asp = (alpha_asp + beta_asp) / 2" squeezed the
+//     upper bound and could cause artificial fail-highs on re-search via TT
+//     and LMR interactions (yo-yo / see-saw effect). Fix: widen only in the
+//     failing direction.
+//   - Aspiration window verbosity: fail-low and fail-high events emit
+//     "info string AW:" lines in the same style as TM messages.
 // =============================================================================
 
 #pragma once
@@ -113,6 +124,15 @@ private:
     // are irrelevant and can mislead move ordering.
     Move killers_[MAX_PLY][2];
 
+    // History heuristic table: records how often a quiet move from [from] to
+    // [to] by [color] has caused a beta cutoff. Incremented by depth^2 on each
+    // cutoff so deeper searches contribute more. Used in move_score() to order
+    // quiet moves — replaces the flat ORDER_QUIET=0 score.
+    // Capped at HISTORY_MAX to prevent overflow and keep scores in a stable
+    // range relative to ORDER_KILLER2. Reset at the start of each search.
+    static constexpr int HISTORY_MAX = 50000;  // Below ORDER_KILLER2 (80000)
+    int history_[2][64][64];                   // [color][from][to]
+
     // Triangular PV array: stores the principal variation at each ply.
     // pv_table_[ply] holds the PV line from that ply to the end of the search.
     // pv_length_[ply] is the number of valid moves in that line.
@@ -125,14 +145,54 @@ private:
     // NULL MOVE PRUNING PARAMETERS
     // -------------------------------------------------------------------------
 
-    // Minimum remaining depth to attempt a null move. Below this threshold
-    // the cost of the reduced search outweighs the expected pruning benefit.
-    static constexpr int NMP_MIN_DEPTH   = 3;
+    // Minimum remaining depth to attempt a null move.
+    static constexpr int NMP_MIN_DEPTH = 3;
 
-    // Depth reduction applied to the null move search (R in standard NMP).
-    // The null move search runs at (depth - 1 - NMP_REDUCTION).
-    // A value of 3 is aggressive but standard for engines without LMR.
-    static constexpr int NMP_REDUCTION   = 3;
+    // Depth reduction for the null move search.
+    // Null move runs at std::max(0, depth - 1 - NMP_REDUCTION).
+    // The std::max(0, ...) floor is required with depth == 0: without it,
+    // NMP at depth==NMP_MIN_DEPTH would pass depth -1, causing infinite
+    // recursion since depth -1 no longer silently enters quiescence.
+    static constexpr int NMP_REDUCTION = 3;
+
+    // Depth at which TM extensions apply their full factor.
+    // The quadratic scaling in go() gives near-zero effect at low depths
+    // and the full factor at EXTENSION_FULL_DEPTH. Calibrated from 1.2
+    // VVLTC showcase: engine reaches depth 14-22 (avg 17.0) at 12h+10min.
+    static constexpr int EXTENSION_FULL_DEPTH = 18;
+
+    // -------------------------------------------------------------------------
+    // LATE MOVE REDUCTIONS (LMR) PARAMETERS
+    // -------------------------------------------------------------------------
+
+    // Minimum remaining depth to attempt LMR. At shallow depths the overhead
+    // of a re-search on fail-high outweighs the pruning benefit.
+    static constexpr int LMR_MIN_DEPTH = 3;
+
+    // Number of legal moves to search at full depth before applying LMR.
+    // The first LMR_MIN_MOVES moves are the highest-scored (TT move, captures,
+    // killers) and most likely to be best — always searched fully.
+    static constexpr int LMR_MIN_MOVES = 3;
+
+    // Divisor in the reduction formula: reduction = log(depth) * log(move) / LMR_DIVISOR.
+    // Larger value = less reduction per move = safer but less pruning.
+    static constexpr double LMR_DIVISOR = 2.25;
+
+    // Easy move reduction factor. When a position qualifies as easy, the soft
+    // limit is multiplied by this value. Must be < 1.0.
+    // If instability is later detected (PV change / score drop), the reduction
+    // is cancelled by multiplying by 1/EASY_REDUCE_FACTOR before applying the
+    // extension, so extensions always act on the un-discounted soft limit.
+    static constexpr double EASY_REDUCE_FACTOR = 0.40;
+
+    // -------------------------------------------------------------------------
+    // ASPIRATION WINDOW PARAMETERS
+    // -------------------------------------------------------------------------
+
+    // Initial half-width of the aspiration window around the previous score.
+    // 50cp is a standard starting value: wide enough to rarely fail spuriously
+    // in stable positions, narrow enough to save meaningful nodes when it holds.
+    static constexpr int ASP_WINDOW = 50;  // centipawns
 
     // -------------------------------------------------------------------------
     // VERBOSITY / OBSERVABILITY
@@ -179,6 +239,24 @@ private:
     // each iteration, so the first alpha-raise would fire every depth without
     // this guard). Set at the end of each completed iteration in go().
     Move prev_best_move_ = MOVE_NONE;
+
+    // Counter for consecutive completed iterations where both the PV move
+    // and score have been stable (same move, score change < 3cp).
+    // When this reaches 7 at depth > 12, go() calls TM.reduce_time(EASY_REDUCE_FACTOR).
+    // Resets to 0 whenever the PV or score changes meaningfully.
+    int stable_iters_ = 0;
+
+    // Set to true when an easy-move reduction has been applied this move.
+    // Cleared at the start of each go() call and whenever a PV change or
+    // score drop triggers cancel_easy_move() before a time extension.
+    // This ensures extensions always act on the un-discounted soft limit.
+    bool easy_move_applied_ = false;
+
+    // Set to true when the "mate found" TM reduction has been applied this move.
+    // Without this guard, is_mate_score(last_score) is true on every subsequent
+    // iteration after a mate is first found, applying x0.05 repeatedly and
+    // collapsing the soft limit exponentially (x0.05^N).
+    bool mate_reduction_applied_ = false;
 
     // -------------------------------------------------------------------------
     // CORE SEARCH FUNCTIONS

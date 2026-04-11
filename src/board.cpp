@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-12 12:30
+// Last modified: 2026-04-11 11:53
 // board.cpp — Board state implementation: FEN parsing, make/unmake, queries
 //
 // Facon 1.0 -- Oxido
@@ -30,6 +30,13 @@
 //     (O-O / O-O-O), promotion suffix, and check/checkmate markers (+ / #).
 //     Used by search.cpp to emit the "new best" info string in human-readable
 //     form. Requires movegen.h for generate_all_moves() (disambiguation).
+//
+// Facon 1.3 -- Yunque
+//   - Fix move_to_san() castling check/mate: the castling branch returned
+//     immediately ("O-O" / "O-O-O") before reaching the check/checkmate
+//     detection at the end of the function. Castling moves that deliver
+//     check or mate were missing the + or # suffix. Fixed by setting san
+//     instead of returning, so the check/mate block runs for all move types.
 // =============================================================================
 
 #include "board.h"
@@ -602,10 +609,10 @@ std::string Board::move_to_san(Move m) const {
 
     // --- Castling ---
     if (mt == CASTLING)
-        return (to > from) ? "O-O" : "O-O-O";
+        san = (to > from) ? "O-O" : "O-O-O";
 
     // --- Pawn ---
-    if (pt == PAWN) {
+    else if (pt == PAWN) {
         if (cap) {
             san += char('a' + file_of(from));
             san += 'x';

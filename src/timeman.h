@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-13 00:00
+// Last modified: 2026-04-06 00:06
 // timeman.h — Time management
 //
 // Decides how much time to spend on the current move based on the remaining
@@ -8,24 +8,36 @@
 // The search calls should_stop() periodically and stops when time is up.
 //
 // Facon 1.1 -- Herrumbre
-//   - Soft/hard limit model replaces the single fixed time budget:
-//       soft_limit: the target time. If a completed iteration exceeds this,
-//                   the search stops normally. Can be extended dynamically.
-//       hard_limit: the absolute maximum. The search stops immediately when
-//                   this is exceeded, even mid-iteration.
-//   - Dynamic extension (extend_time): the soft limit is stretched when the
-//     search detects instability (PV move changed) or a score drop between
-//     iterations. Allows more time on difficult positions.
+//   - Soft/hard limit model replaces the single fixed time budget.
+//   - Dynamic extension (extend_time): soft limit stretched on PV instability
+//     or score drop.
 //
 // Facon 1.2 -- Rojo Vivo
-//   - extend_time() reason parameter: accepts optional label, emits
-//     "info string TM extend xF (reason) -- soft Xms -> Yms [h:mm:ss,ms]".
-//   - start() allocation report: emits soft/hard limits and effective clock
-//     on each call, for real-time TM diagnostics.
-//   - Time forfeit fix: OVERHEAD_MS subtracted from remaining upfront;
-//     HARD_FACTOR lowered 3.0->2.0; SAFETY_FACTOR lowered 0.95->0.90;
-//     hard_limit capped at remaining/3 (was /2); should_stop() returns true
-//     STOP_GRACE_MS (100ms) before hard_limit to guarantee bestmove delivery.
+//   - extend_time() reason parameter; start() allocation report.
+//   - Time forfeit fix: OVERHEAD_MS, HARD_FACTOR 2.0, SAFETY_FACTOR 0.90,
+//     hard_limit cap remaining/3, STOP_GRACE_MS 100ms.
+//
+// Facon 1.3 -- Yunque
+//   - reduce_time(): mirrors extend_time() for easy positions. Multiplies
+//     the soft limit by a factor < 1.0, floored at MIN_TIME_MS. Triggers:
+//     mate found (x0.05), forced move (x0.1), PV stable 7+ iters (x0.4).
+//   - accumulated_ext_ cap REMOVED: near-zero quadratic factors at low depths
+//     consumed the 2.0x budget, leaving no headroom for real extensions at
+//     depth 14+. The soft limit is now bounded only by the hard limit.
+//   - extend_time() guard: if factor <= 1.0, returns immediately without
+//     effect. Use reduce_time() to shrink the soft limit.
+//   - cancel_easy_move(): reverses a prior easy-move reduction before
+//     applying a time extension. Multiplies soft limit by 1/factor.
+//     Does NOT touch accumulated_ext_. Capped at hard_limit.
+//   - extend_time() depth parameter: when depth >= EMERGENCY_DEPTH (25) and
+//     the computed new soft would exceed the hard limit, instead of capping
+//     soft at hard we raise hard to match soft (capped at 50% of the raw
+//     remaining clock). This allows genuinely deep, unstable positions to use
+//     more time without triggering the mechanism on stable easy positions.
+//     Both soft and hard then rise together on subsequent extensions.
+//     A distinct "complex position" message is emitted in this case.
+//     raw_remaining_ms_ is stored at start() to make this computation
+//     available throughout the search.
 // =============================================================================
 
 #pragma once
@@ -90,6 +102,17 @@ struct TimeManager {
     // Must be atomic because it is written from one thread and read from another.
     std::atomic<bool> stop { false };
 
+    // Accumulated extension factor since start(). Tracks the product of all
+    // factors applied via extend_time(). No longer used as a hard cap —
+    // the cap was removed because near-zero factors at low depths consumed
+    // the budget before real extensions at depth 14+ could fire. Kept for
+    // diagnostic output only. Reset to 1.0 in start() and reset().
+    double accumulated_ext_ = 1.0;
+
+    // Raw remaining clock time stored at start(), used by extend_time() to
+    // compute the 50%-of-remaining ceiling for the complex position path.
+    int raw_remaining_ms_ = 0;
+
     // -------------------------------------------------------------------------
     // INTERFACE
     // -------------------------------------------------------------------------
@@ -111,9 +134,31 @@ struct TimeManager {
 
     // Extend the soft limit by a given factor (e.g. 1.5 = 50% more time).
     // Called when the search detects PV instability or a score drop.
-    // The extended limit is capped at the hard limit to prevent time trouble.
+    //
+    // Normal path (depth < EMERGENCY_DEPTH or new_soft <= hard):
+    //   soft = min(soft * factor, hard). Message: "TM: extend ... (hard ..., headroom ...)"
+    //
+    // Complex position path (depth >= EMERGENCY_DEPTH and new_soft > hard):
+    //   hard is raised to match new_soft, capped at 50% of raw remaining clock.
+    //   Both soft and hard rise together on subsequent extensions.
+    //   Message: "TM: extend ... (PV change, complex position) ... / hard ... -> ... (absolute limit ..., headroom ...)"
+    //
     // 'reason' is a short human-readable label emitted in the info string.
-    void extend_time(double factor, const char* reason = "");
+    // 'depth' is the current iterative deepening depth (default 0 = normal path).
+    void extend_time(double factor, const char* reason = "", int depth = 0);
+
+    // Shrink the soft limit by a given factor (e.g. 0.4 = 60% reduction).
+    // Called when the position is clearly resolved — mate found, forced move,
+    // or PV and score have been stable for several consecutive iterations.
+    // The reduced limit is floored at MIN_TIME_MS.
+    // 'reason' is a short human-readable label emitted in the info string.
+    void reduce_time(double factor, const char* reason = "");
+
+    // Cancel a previous easy-move reduction before applying a time extension.
+    // Multiplies the soft limit by 1/reduce_factor (the reciprocal of whatever
+    // factor was passed to reduce_time for the easy move). Does NOT touch
+    // accumulated_ext_. Capped at hard_limit. Emits an info string.
+    void cancel_easy_move(double reduce_factor);
 
     // Reset all configuration fields to their defaults.
     // Call before populating with a new "go" command's parameters.

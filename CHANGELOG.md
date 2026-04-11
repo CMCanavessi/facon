@@ -1,13 +1,60 @@
 # Changelog
-<!-- Last modified: 2026-03-19 00:00 -->
+<!-- Last modified: 2026-04-11 11:53 -->
 
 All notable changes to Facón will be documented here.
 
 ---
 
+## [1.3] "Yunque" — 2026-04-11
+
+### Pre-work bug fixes
+
+- **NMP depth floor** (`search.cpp`): the NMP recursive call was passing `depth - 1 - NMP_REDUCTION` without a floor. At `depth == NMP_MIN_DEPTH` (3) this produces -1, which with the corrected `depth == 0` condition no longer enters quiescence — causing infinite recursion and a search hang at depth 4+. Fixed: `std::max(0, depth - 1 - NMP_REDUCTION)`.
+- **`depth <= 0` → `depth == 0`** (`search.cpp`): prerequisite for LMR. With reductions, a node can be called with a reduced depth of exactly 0; `depth == 0` enters quiescence precisely at that point. Negative depths are no longer silently absorbed — they cause a detectable hang. All reduction call sites use `std::max(0, reduced_depth)`.
+
+### Infrastructure
+
+- **Centralized version system** (`CMakeLists.txt`, `src/version.h.in`, `src/version.rc.in`): `PROJECT_VERSION` and `FACON_CODENAME` in `CMakeLists.txt` are the single source of truth. CMake generates `version.h` at build time via `configure_file`. Binary name, startup banner, UCI `id name`, and Windows version resource all derive from these two variables. To release: set `FACON_CODENAME "Yunque"` and recompile. `src/version.rc` (static file from 1.2) is deleted — replaced by `src/version.rc.in`.
+- **`bitboard.cpp` init message gated** (`bitboard.cpp`): "Initializing magic bitboards... done." now only prints when stderr is a terminal (`isatty()`). Suppressed when launched by GUI or fastchess.
+- **`perft` command** (`uci.cpp`, `uci.h`): `perft N` counts leaf nodes to depth N from the current position and reports total nodes and elapsed time. `perft divide N` breaks the count down per first legal move. Bulk-counting optimization at depth 1. Verified: startpos depth 5 = 4,865,609.
+- **Build directory naming** (`CMakeLists.txt`): quick start updated from `build` to `build-linux` / `build-windows`.
+
+### Search
+
+- **LMR (Late Move Reductions)** (`search.cpp`, `search.h`): moves searched after the first `LMR_MIN_MOVES` (3) legal moves at depth ≥ `LMR_MIN_DEPTH` (3) are searched at reduced depth if quiet and not in check. Formula: `reduction = log(depth) × log(move_number) / LMR_DIVISOR` (2.25). Re-searched at full depth if the reduced search raises alpha.
+- **History heuristic** (`search.cpp`, `search.h`): `history_[color][from][to]` incremented by `depth²` on beta cutoffs. Replaces flat `ORDER_QUIET=0` score for quiet move ordering. Capped at `HISTORY_MAX` (50,000). Reset each search.
+- **Aspiration windows** (`search.cpp`, `search.h`): iterative deepening searches with a ±`ASP_WINDOW` (50cp) window around the previous score from depth 4+. On fail-low or fail-high, widens only in the failing direction and doubles delta. Full window used for depth < 4 and mate scores.
+- **Aspiration window fail-low fix** (`search.cpp`): the original fail-low handler set `beta_asp = (alpha_asp + beta_asp) / 2`, squeezing the upper bound. On re-search, TT and LMR interactions can cause the score to rebound above the narrowed ceiling, triggering a spurious fail-high and forcing a third search (yo-yo effect). Fixed: on fail-low, widen alpha only; leave beta unchanged. Standard implementation.
+- **Aspiration window verbosity** (`search.cpp`): fail-low and fail-high events emit `info string ASP fail-{low|high} depth D score S window [α, β] delta D` lines, consistent with TM extension/reduction verbosity.
+
+### Evaluation
+
+- **Pawn structure** (`eval.cpp`, `eval.h`): five terms via bitboard operations — isolated (−15cp), doubled (−15cp), backward (−12cp), passed (rank-scaled: 0/0/10/20/35/55/80cp), connected (+8cp). All computed symmetrically for both colors.
+- **Mopup insufficient material guard** (`eval.cpp`): K+B vs K and K+N vs K are theoretical draws. Both positions exceed `MOPUP_THRESHOLD` (300cp) and previously activated mopup. `mopup_eval()` now returns 0 when the strong side has exactly one minor piece and no pawns.
+
+### Time Management
+
+- **Quadratic extension scaling** (`search.cpp`, `search.h`): `extend_time()` calls in `go()` pre-scale the factor by `(depth² / EXTENSION_FULL_DEPTH²)`. PV changes at depth 2–9 have near-zero effect; extensions at the engine's operating depth (14+) apply the full factor. `EXTENSION_FULL_DEPTH = 18`.
+- **`accumulated_ext_` cap removed** (`timeman.cpp`, `timeman.h`): the old 2.0× cap caused near-zero quadratic factors at low depths to consume the extension budget before real extensions at depth 14+ could fire. The soft limit is now bounded only by the hard limit.
+- **`extend_time()` guard** (`timeman.cpp`): `if (factor <= 1.0) return` — a factor ≤ 1.0 would shrink the soft limit silently. Use `reduce_time()` instead.
+- **`reduce_time()`** (`timeman.h`, `timeman.cpp`): mirrors `extend_time()`. Multiplies the soft limit by a factor < 1.0, floored at `MIN_TIME_MS`. Triggers: mate found (×0.05, one-shot), forced move (×0.1), PV+score stable ≥ 7 iterations at depth > 12 (×0.4, one-shot).
+- **`mate_reduction_applied_`** (`search.h`, `search.cpp`): one-shot guard for the "mate found" reduction. Without it, `is_mate_score()` is true on every subsequent iteration, collapsing the soft limit exponentially (×0.05^N).
+- **`stable_iters_`** (`search.h`, `search.cpp`): counter for consecutive stable iterations (same PV move, score change < 3cp at depth > 12). Threshold raised from 3 to 7; easy-move factor changed from ×0.6 to ×0.4.
+- **`cancel_easy_move()`** (`timeman.h`, `timeman.cpp`): reverses a prior easy-move reduction before applying a PV change or score drop extension. Multiplies soft limit by 1/factor. Does not touch `accumulated_ext_`.
+- **Emergency hard limit** (`timeman.h`, `timeman.cpp`, `search.cpp`, `search.h`): when a depth ≥ 25 iteration completes, `TM.raise_emergency_limit()` raises the hard limit from 33.3% to 50% of raw remaining clock. Fires once per move. Allows genuinely deep, complex positions to use more time than the normal cap permits.
+
+### Infrastructure / Bugfixes
+
+- **Race condition in `cmd_ucinewgame()`** (`uci.cpp`): `TT.clear()` (which uses `std::memset`) could race with `TT.probe()` / `TT.store()` in the search thread if "ucinewgame" arrived while searching. Fixed by joining the search thread before clearing the TT and resetting the board.
+- **`move_to_san()` castling check/mate** (`board.cpp`): the castling branch returned immediately (`"O-O"` / `"O-O-O"`) before reaching the check/checkmate detection block. Castling moves that deliver check or mate were missing the `+` or `#` suffix. Fixed by setting `san` instead of returning, so the check/mate annotation runs for all move types.
+- **`seen[]` guard mismatch** (`search.cpp`): the PV repetition detection array was enlarged to `MAX_GAME_HISTORY + MAX_PLY + 2` (1154 slots) in 1.2, but the insertion guard still used `MAX_GAME_HISTORY + MAX_PLY` (1152), stopping 2 entries short. Updated the guard to match the array size.
+- **Mopup insufficient material guard — implementation** (`eval.cpp`): the guard documented in 1.3 (K+B vs K and K+N vs K return 0 from `mopup_eval()`) was described in `eval.h` but never implemented in `eval.cpp`. Added the check: if the strong side has exactly two pieces (king + one minor), `mopup_eval()` returns 0.
+
+---
+
 ## [1.2] "Rojo Vivo" — 2026-03-14
 
-**+33.5% over 1.1** (870.0/1040 = 83.7% vs same 26-opponent field at 2min+1sec; Ordo **~1690**)
+**+33.5% over 1.1** (870.0/1040 = 83.7% vs same 26-opponent field at 2min+1sec; Ordo **~1700**)
 
 ### Pre-work fixes
 

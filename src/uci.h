@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-12 12:30
+// Last modified: 2026-03-27 00:00
 // uci.h — Universal Chess Interface protocol handler
 //
 // Reads commands from stdin line by line and dispatches them to the engine.
@@ -16,12 +16,15 @@
 //   - UCI threading: cmd_go() launches the search in a dedicated std::thread
 //     (search_thread_) and returns immediately. The UCI loop can now read
 //     stdin while the engine is searching, making "stop" functional.
-//     Previously cmd_go() blocked the loop and "stop" was never received.
-//     cmd_stop() sets TM.stop and joins the thread, which unwinds cleanly
-//     via the abort_search_ flag in Search.
 //   - isatty()-gated prompt: the interactive "> " prompt is printed to stderr
-//     only when stdin is a terminal. Suppressed when launched by a GUI or
-//     fastchess so stdout stays clean for automated UCI parsing.
+//     only when stdin is a terminal.
+//
+// Facon 1.3 -- Yunque
+//   - perft command: "perft N" counts leaf nodes to depth N from the current
+//     position. "perft divide N" breaks the count down by first legal move.
+//     Used to verify move generator correctness before any movegen changes.
+//   - id name now uses FACON_VERSION from version.h (CMake-generated) instead
+//     of a hardcoded string.
 // =============================================================================
 
 #pragma once
@@ -78,6 +81,12 @@ private:
 
     // "d" — display the current board (debug command, not part of UCI spec)
     void cmd_display();
+
+    // "perft N" / "perft divide N" — count leaf nodes to depth N.
+    // Not part of the UCI spec. Used to verify move generator correctness.
+    // "perft N" prints total nodes and elapsed time.
+    // "perft divide N" also prints the node count per first legal move.
+    void cmd_perft(std::istringstream& ss);
 
     // -------------------------------------------------------------------------
     // HELPERS

@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-19 00:00
+// Last modified: 2026-04-11 11:53
 // eval.cpp — Material + Piece-Square Table evaluation
 //
 // PST values are from the perspective of WHITE, stored from a1..h8
@@ -22,6 +22,19 @@
 //     and (b) closing the distance between kings (14 - manhattan_distance).
 //     Activated only when no pawns remain and the raw material+PST advantage
 //     exceeds MOPUP_THRESHOLD. Constants defined in eval.h.
+//
+// Facon 1.3 — Yunque
+//   - Pawn structure evaluation: five terms computed via bitboard operations
+//     with no per-square loops. All terms are from White's perspective and
+//     mirrored for Black by flipping rank bits.
+//     * Isolated pawns: no friendly pawns on adjacent files. Penalty per pawn.
+//     * Doubled pawns: more than one pawn on the same file. Penalty per extra.
+//     * Backward pawns: cannot advance safely, cannot be supported by a
+//       friendly pawn. Penalty per pawn.
+//     * Passed pawns: no enemy pawn can block or attack on the path to
+//       promotion. Bonus scaled by rank (rank 7 = largest bonus).
+//     * Connected pawns: supported diagonally by a friendly pawn. Small bonus.
+//     Constants defined in eval.h.
 // =============================================================================
 
 #include "eval.h"
@@ -304,6 +317,20 @@ static int king_distance(Square a, Square b) {
 // weak_side:   the side being mated.
 static Score mopup_eval(const Board& board, Color strong_side) {
     Color  weak_side    = ~strong_side;
+
+    // Insufficient material guard: K+B vs K and K+N vs K are theoretical
+    // draws — no sequence of moves can force checkmate. Without this guard,
+    // K+B (330cp) and K+N (320cp) exceed MOPUP_THRESHOLD (300cp) and activate
+    // corner-chasing in drawn endings, causing the engine to refuse draws and
+    // wander indefinitely.
+    Bitboard strong_pieces = board.all_pieces(strong_side);
+    int strong_count = popcount(strong_pieces);  // includes king
+    if (strong_count == 2) {
+        // King + one piece. Check if that piece is a lone bishop or knight.
+        if (board.piece_bb(strong_side, BISHOP) || board.piece_bb(strong_side, KNIGHT))
+            return 0;
+    }
+
     Square strong_king  = board.king_square(strong_side);
     Square weak_king    = board.king_square(weak_side);
 
@@ -314,6 +341,176 @@ static Score mopup_eval(const Board& board, Color strong_side) {
     // Return from White's perspective: positive if White is winning, negative
     // if Black is winning. evaluate() will flip for side to move as usual.
     return (strong_side == WHITE) ? Score(bonus) : Score(-bonus);
+}
+
+// =============================================================================
+// PAWN STRUCTURE EVALUATION
+// =============================================================================
+// Evaluates pawn structure for both sides and returns the score from White's
+// perspective. All terms use bitboard operations — no per-square loops.
+//
+// The five terms and their intuition:
+//
+// ISOLATED: a pawn with no friendly pawns on adjacent files has no support
+//   and controls fewer squares. Penalty per isolated pawn.
+//
+// DOUBLED: two pawns on the same file block each other, only one can advance.
+//   Penalty per extra pawn beyond the first on each file.
+//
+// BACKWARD: a pawn that cannot advance safely (the stop square is attacked by
+//   an enemy pawn) and cannot be supported by a friendly pawn push. This is
+//   the weakest pawn structure weakness: the pawn is stuck and an easy target.
+//   Penalty per backward pawn.
+//
+// PASSED: no enemy pawn can ever capture or block this pawn on its path to
+//   promotion. Passed pawns are winning endgame assets. Bonus scaled by rank:
+//   the closer to promotion, the larger the bonus.
+//
+// CONNECTED: a pawn diagonally supported by a friendly pawn. Connected pawns
+//   are mobile and mutually defending — harder to attack than isolated ones.
+//   Small bonus per connected pawn.
+//
+// All computations are symmetric: White uses the actual bitboard operations,
+// Black uses the same logic with north/south swapped (shift direction inverted).
+
+// Returns a bitboard with all squares on a given file set.
+// Used to detect doubled pawns and build passed pawn masks.
+static inline Bitboard file_bb(int f) {
+    return FILE_A_BB << f;
+}
+
+// Returns a bitboard of all squares on files adjacent to file f (but not f itself).
+// Used to detect isolated pawns: if (pawns & adjacent_files(f)) == 0, isolated.
+static inline Bitboard adjacent_files_bb(int f) {
+    Bitboard adj = 0;
+    if (f > 0) adj |= FILE_A_BB << (f - 1);
+    if (f < 7) adj |= FILE_A_BB << (f + 1);
+    return adj;
+}
+
+// Bonus indexed by rank (0=rank1 .. 7=rank8) for passed pawns.
+// Rank 0 and 1 are unreachable for a passed pawn (would have promoted).
+// Bonus grows sharply in the last three ranks where promotion is imminent.
+static const int PASSED_BONUS[8] = { 0, 0, 10, 20, 35, 55, 80, 0 };
+// Rank 7 is 0 because a pawn on rank 8 has promoted — can't happen.
+
+static Score pawn_structure(const Board& board) {
+    Score white_score = 0;
+    Score black_score = 0;
+
+    Bitboard white_pawns = board.piece_bb(WHITE, PAWN);
+    Bitboard black_pawns = board.piece_bb(BLACK, PAWN);
+
+    // Precompute attack spans for both sides:
+    // white_attack_span: all squares that white pawns attack, extended forward.
+    // A pawn on e4 attacks d5 and f5, and "controls" d6,d7,d8,f6,f7,f8 too.
+    // We need the full forward span to detect passed pawns and backward pawns.
+    //
+    // fill_north / fill_south: flood-fill in one direction through all ranks.
+    // We build these manually via repeated shifts.
+
+    // Pawn attack spans (all squares attacked on the path to promotion):
+    // White: shift NE and NW for all white pawns, then fill north.
+    // Black: shift SE and SW for all black pawns, then fill south.
+
+    // Helper: fill a bitboard northward through all ranks
+    auto fill_north = [](Bitboard b) -> Bitboard {
+        b |= b << 8; b |= b << 16; b |= b << 32;
+        return b;
+    };
+    auto fill_south = [](Bitboard b) -> Bitboard {
+        b |= b >> 8; b |= b >> 16; b |= b >> 32;
+        return b;
+    };
+
+    // Attack span: squares attacked on the path to promotion.
+    // Used for: (1) passed pawn detection, (2) backward pawn detection.
+    Bitboard white_attack_span = fill_north(pawn_attacks_bb(WHITE, white_pawns));
+    Bitboard black_attack_span = fill_south(pawn_attacks_bb(BLACK, black_pawns));
+
+    // -------------------------------------------------------------------------
+    // Evaluate each color's pawn structure
+    // -------------------------------------------------------------------------
+    // We loop over files (0..7) for doubled/isolated detection,
+    // then loop over individual pawns for backward/passed/connected.
+
+    for (Color c : {WHITE, BLACK}) {
+        Bitboard our_pawns   = (c == WHITE) ? white_pawns  : black_pawns;
+        Bitboard their_pawns = (c == WHITE) ? black_pawns  : white_pawns;
+        Score& score = (c == WHITE) ? white_score : black_score;
+
+        // --- ISOLATED and DOUBLED: loop over files ---
+        for (int f = 0; f < 8; f++) {
+            Bitboard pawns_on_file = our_pawns & file_bb(f);
+            if (!pawns_on_file) continue;
+
+            int count = popcount(pawns_on_file);
+
+            // Doubled: more than one pawn on the file
+            if (count > 1)
+                score += PAWN_DOUBLED * (count - 1);
+
+            // Isolated: no friendly pawns on adjacent files
+            if (!(our_pawns & adjacent_files_bb(f)))
+                score += PAWN_ISOLATED * count;
+        }
+
+        // --- BACKWARD, PASSED, CONNECTED: loop over individual pawns ---
+        Bitboard pawns = our_pawns;
+        while (pawns) {
+            Square sq   = pop_lsb(pawns);
+            int    rank = rank_of(sq);
+
+            // Stop square: the square directly in front of this pawn.
+            // White: one rank up. Black: one rank down.
+            Square stop = (c == WHITE) ? Square(sq + 8) : Square(sq - 8);
+
+            // --- PASSED ---
+            // A pawn is passed if no enemy pawn occupies its front span
+            // (directly ahead) or its attack span (diagonally ahead).
+            // We build both spans for this specific pawn and check against
+            // the enemy pawn bitboard.
+            Bitboard this_front = fill_north(square_bb(stop));
+            Bitboard this_attack_forward = fill_north(pawn_attacks_bb(c, square_bb(sq)));
+            if (c == BLACK) {
+                this_front        = fill_south(square_bb(stop));
+                this_attack_forward = fill_south(pawn_attacks_bb(c, square_bb(sq)));
+            }
+            bool is_passed = !(their_pawns & (this_front | this_attack_forward));
+            if (is_passed) {
+                // Bonus by rank from our perspective: White rank 0-7, Black mirror.
+                int bonus_rank = (c == WHITE) ? rank : (7 - rank);
+                score += PASSED_BONUS[bonus_rank];
+            }
+
+            // --- BACKWARD ---
+            // A pawn is backward if:
+            //   1. Its stop square is attacked by an enemy pawn.
+            //   2. There is no friendly pawn that could advance to support it.
+            //      (i.e., no friendly pawn on adjacent files that is on the same
+            //       rank or behind this pawn that could push forward to defend.)
+            // We approximate condition 2 as: this pawn is NOT in the attack span
+            // of any friendly pawn (meaning no friend attacks the stop square
+            // from behind).
+            Bitboard friendly_attack_span = (c == WHITE) ? white_attack_span
+                                                         : black_attack_span;
+            bool stop_attacked_by_enemy = (pawn_attacks_bb(c, square_bb(stop))
+                                           & their_pawns) != 0;
+            bool no_friendly_support    = !(square_bb(sq) & friendly_attack_span);
+            // Don't double-count isolated (which is already penalized above).
+            // Backward only applies when the pawn is genuinely stuck.
+            if (stop_attacked_by_enemy && no_friendly_support && !is_passed)
+                score += PAWN_BACKWARD;
+
+            // --- CONNECTED ---
+            // A pawn is connected if it is diagonally supported by a friendly pawn
+            // (i.e., a friendly pawn attacks this pawn's square).
+            if (pawn_attacks_bb(~c, square_bb(sq)) & our_pawns)
+                score += PAWN_CONNECTED;
+        }
+    }
+
+    return white_score - black_score;
 }
 
 // =============================================================================
@@ -352,6 +549,10 @@ Score evaluate(const Board& board) {
 
     // Compute score from White's perspective, then flip for the side to move.
     Score score = white_score - black_score;
+
+    // Pawn structure: isolated, doubled, backward, passed, connected.
+    // Returned from White's perspective — added directly to score.
+    score += pawn_structure(board);
 
     // -------------------------------------------------------------------------
     // MOPUP EVALUATION

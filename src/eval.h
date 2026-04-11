@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-11 23:49
+// Last modified: 2026-04-05 00:01
 // eval.h — Position evaluation
 //
 // Returns a score in centipawns (100 = one pawn advantage) from the
@@ -19,6 +19,14 @@
 //     hold a winning advantage but fail to convert — wandering without
 //     a plan. Applied only when no pawns remain and the material
 //     advantage exceeds MOPUP_THRESHOLD.
+//
+// Facon 1.3 — Yunque
+//   - Pawn structure: isolated, doubled, backward, passed, connected pawns.
+//     All terms computed via bitboard operations. Constants below.
+//   - Insufficient material guard: mopup_eval() now returns 0 for K+B vs K
+//     and K+N vs K (theoretical draws). Without this, K+B (330cp) exceeded
+//     the MOPUP_THRESHOLD (300cp) and activated corner-chasing in drawn
+//     endings.
 // =============================================================================
 
 #pragma once
@@ -47,6 +55,32 @@ constexpr Score PIECE_VALUE[7] = {
     QUEEN_VALUE,
     KING_VALUE
 };
+
+// =============================================================================
+// PAWN STRUCTURE CONSTANTS
+// =============================================================================
+// All values in centipawns. Penalties are negative, bonuses positive.
+// These are starting values calibrated by hand — Texel tuning in 1.7 will
+// refine them. Signs: negative = bad for the pawn's owner.
+
+// Penalty per isolated pawn (no friendly pawns on adjacent files).
+// Isolated pawns cannot be defended by other pawns and require piece support.
+constexpr int PAWN_ISOLATED  = -15;
+
+// Penalty per extra pawn on the same file beyond the first.
+// Doubled pawns block each other and are easy targets on open files.
+constexpr int PAWN_DOUBLED   = -15;
+
+// Penalty per backward pawn (stop square attacked by enemy, no friendly
+// pawn can advance to support it). The weakest pawn structure weakness.
+constexpr int PAWN_BACKWARD  = -12;
+
+// Bonus per connected pawn (diagonally supported by a friendly pawn).
+// Connected pawns are mutually defending and harder to target.
+constexpr int PAWN_CONNECTED  =  8;
+
+// Passed pawn bonus by rank (defined in eval.cpp as PASSED_BONUS[8]).
+// Declared here for documentation; the array lives in eval.cpp.
 
 // =============================================================================
 // MOPUP EVALUATION CONSTANTS

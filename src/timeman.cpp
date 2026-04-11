@@ -1,40 +1,35 @@
 // =============================================================================
-// Last modified: 2026-03-14 00:00
+// Last modified: 2026-04-06 00:06
 // timeman.cpp — Time management implementation
 //
 // Facon 1.1 — Herrumbre
 //   Replaced the single fixed time budget with a soft/hard limit model.
 //
-//   soft_limit: the normal target time. After each completed iteration, if
-//               elapsed >= soft_limit the search stops. This limit can be
-//               extended dynamically (see extend_time) when the search detects
-//               that the position is difficult.
-//
-//   hard_limit: the absolute ceiling. The search stops immediately at any
-//               point when elapsed >= hard_limit, even mid-iteration. Set to
-//               a multiple of the soft limit to allow extensions without
-//               risking time trouble.
-//
-// Dynamic extension policy (applied in search.cpp after each iteration):
-//   - PV move changed between iterations: x1.5 — the engine is reconsidering
-//     its best move, which often means it needs more time to stabilize.
-//   - Score dropped significantly (>= SCORE_DROP_THRESHOLD): x1.25 — the
-//     engine found something bad; extra time helps find a way out.
-//   Both conditions can apply simultaneously (multiplicative).
-//   The extended soft limit is always capped at hard_limit.
-//
 // Facon 1.2 -- Rojo Vivo
 //   - Verbosity: start() reports base, soft, and hard limits computed for each
 //     move. extend_time() reports trigger reason, old/new soft, and headroom.
-//     These are pure stdout writes with no effect on search correctness.
-//   - Time forfeit fix (late 1.2): engine was losing ~75% of games on time in
-//     the gauntlet due to three compounding issues: (a) HARD_FACTOR=3.0 was
-//     too generous, (b) SAFETY_FACTOR=0.95 left only 5% headroom for OS
-//     jitter/GUI latency, (c) no fixed overhead buffer for move transmission.
-//     Fix: added OVERHEAD_MS (subtracted from remaining upfront), lowered
-//     HARD_FACTOR to 2.0 and SAFETY_FACTOR to 0.90, added 100ms grace buffer
-//     in should_stop() and a hard_limit floor guard. The hard_limit is also
-//     capped at remaining/3 (was /2) to prevent single-move time blowout.
+//   - Time forfeit fix: OVERHEAD_MS, HARD_FACTOR 2.0, SAFETY_FACTOR 0.90,
+//     hard_limit cap remaining/3, STOP_GRACE_MS 100ms.
+//
+// Facon 1.3 -- Yunque
+//   - extend_time() guard: if factor <= 1.0, returns immediately. A factor
+//     <= 1.0 would silently shrink the soft limit; use reduce_time() instead.
+//   - accumulated_ext_ cap REMOVED: the cap (MAX_EXTENSION_FACTOR=2.0) was
+//     causing legitimate deep-search extensions to be silently dropped because
+//     near-zero quadratic factors at low depths consumed the budget. The soft
+//     limit is now bounded only by the hard limit.
+//   - reduce_time(): mirrors extend_time() for easy positions. Multiplies the
+//     soft limit by a factor < 1.0, floored at MIN_TIME_MS. Emits an info
+//     string with hard and headroom (consistent with extend_time output).
+//   - cancel_easy_move(): reverses a prior easy-move reduction by multiplying
+//     the soft limit by 1/reduce_factor. Does NOT touch accumulated_ext_.
+//     Emits an info string with hard and headroom.
+//   - extend_time() depth parameter + complex position path: when depth >=
+//     EMERGENCY_DEPTH (25) and new_soft > hard, instead of capping soft at
+//     hard we raise hard to match soft (cap: 50% of raw remaining clock).
+//     Both limits then rise together on subsequent extensions. A distinct
+//     "complex position" message is emitted showing both limit changes, the
+//     absolute ceiling, and remaining headroom.
 // =============================================================================
 
 #include "timeman.h"
@@ -101,8 +96,10 @@ static void format_time(char* buf, size_t sz, int64_t ms) {
 // =============================================================================
 
 void TimeManager::start(Color side) {
-    start_time = Clock::now();
-    stop       = false;
+    start_time        = Clock::now();
+    stop              = false;
+    accumulated_ext_  = 1.0;
+    raw_remaining_ms_ = (side == WHITE) ? time_white : time_black;
 
     // Infinite search: allocate an arbitrarily large time budget.
     // The search will only stop when an explicit "stop" command arrives.
@@ -210,23 +207,101 @@ bool TimeManager::soft_stop() const {
 // =============================================================================
 // EXTEND TIME
 // =============================================================================
-// Stretches the soft limit by the given factor when the search detects a
-// difficult position. The hard limit acts as a ceiling — extensions can never
-// push the engine past the absolute time budget.
+// Stretches the soft limit by the given factor when the search detects
+// instability (PV change or score drop).
 //
-// Typical callers:
-//   - PV move changed: extend_time(1.5)
-//   - Score dropped significantly: extend_time(1.25)
-// Both can apply in the same iteration (multiplicative effect).
+// Normal path (depth < EMERGENCY_DEPTH or new_soft <= hard):
+//   soft = min(soft * factor, hard). The hard limit stays fixed.
+//   Message: "TM: extend xF (reason) -- soft OLD -> NEW (hard H, headroom R) [T]"
+//
+// Complex position path (depth >= EMERGENCY_DEPTH and new_soft > hard):
+//   The position is genuinely deep AND unstable. Instead of capping soft at
+//   hard, we raise hard to match soft (cap: 50% of raw remaining clock).
+//   Both limits rise together on subsequent extensions. This is triggered by
+//   real instability — stable positions at depth 25+ would have fired the
+//   easy-move reduction before reaching here.
+//   Message: "TM: extend xF (reason, complex position) -- soft OLD -> NEW /
+//             hard OLDH -> NEWH (absolute limit L, headroom R) [T]"
 
-void TimeManager::extend_time(double factor, const char* reason) {
-    // No-op during infinite search -- limits are the sentinel value (1<<28),
-    // there is nothing meaningful to extend or report.
+// Depth at which the complex position path is activated. This is intentionally
+// a TM constant rather than a search constant — it governs TM behavior directly.
+// At depth < EMERGENCY_DEPTH, extend_time() always caps soft at hard (normal).
+static constexpr int EMERGENCY_DEPTH = 25;
+
+void TimeManager::extend_time(double factor, const char* reason, int depth) {
+    if (infinite)      return;
+    if (factor <= 1.0) return;  // Use reduce_time() to shrink
+
+    int new_soft = int(soft_limit_ms * factor);
+    accumulated_ext_ *= factor;
+
+    if (depth >= EMERGENCY_DEPTH && new_soft > hard_limit_ms) {
+        // Complex position path: soft would exceed hard, so raise hard to match.
+        // Both are capped at 50% of raw remaining clock — the absolute ceiling
+        // for any single move regardless of instability.
+        int absolute_limit = raw_remaining_ms_ / 2;
+        new_soft           = std::min(new_soft, absolute_limit);
+        int old_soft       = soft_limit_ms;
+        int old_hard       = hard_limit_ms;
+        soft_limit_ms      = new_soft;
+        hard_limit_ms      = new_soft;  // hard matches soft exactly
+        int headroom       = absolute_limit - soft_limit_ms;
+
+        char t_now[32], t_soft_old[32], t_soft_new[32],
+             t_hard_old[32], t_hard_new[32], t_abs[32], t_head[32];
+        format_time(t_now,      sizeof(t_now),      elapsed_ms());
+        format_time(t_soft_old, sizeof(t_soft_old), old_soft);
+        format_time(t_soft_new, sizeof(t_soft_new), soft_limit_ms);
+        format_time(t_hard_old, sizeof(t_hard_old), old_hard);
+        format_time(t_hard_new, sizeof(t_hard_new), hard_limit_ms);
+        format_time(t_abs,      sizeof(t_abs),      absolute_limit);
+        format_time(t_head,     sizeof(t_head),     headroom);
+
+        std::cout << "info string TM: extend x" << factor;
+        if (reason && reason[0]) std::cout << " (" << reason << ", complex position)";
+        std::cout << " -- soft " << t_soft_old << " -> " << t_soft_new
+                  << " / hard " << t_hard_old << " -> " << t_hard_new
+                  << " (absolute limit " << t_abs << ", headroom " << t_head << ")"
+                  << " [" << t_now << "]\n"
+                  << std::flush;
+    } else {
+        // Normal path: soft is capped at hard as usual.
+        int old_soft  = soft_limit_ms;
+        soft_limit_ms = std::min(new_soft, hard_limit_ms);
+        int headroom  = hard_limit_ms - soft_limit_ms;
+
+        char t_now[32], t_old[32], t_new[32], t_hard[32], t_head[32];
+        format_time(t_now,  sizeof(t_now),  elapsed_ms());
+        format_time(t_old,  sizeof(t_old),  old_soft);
+        format_time(t_new,  sizeof(t_new),  soft_limit_ms);
+        format_time(t_hard, sizeof(t_hard), hard_limit_ms);
+        format_time(t_head, sizeof(t_head), headroom);
+
+        std::cout << "info string TM: extend x" << factor;
+        if (reason && reason[0]) std::cout << " (" << reason << ")";
+        std::cout << " -- soft " << t_old << " -> " << t_new
+                  << " (hard " << t_hard << ", headroom " << t_head << ")"
+                  << " [" << t_now << "]\n"
+                  << std::flush;
+    }
+}
+
+// =============================================================================
+// REDUCE TIME
+// =============================================================================
+// Shrinks the soft limit for easy positions — the engine already knows what
+// to play. Floored at MIN_TIME_MS to always spend a minimal amount of time.
+//
+// Typical callers (from search.cpp go()):
+//   - Mate line found at root:            reduce_time(0.05, "mate found")
+//   - Single legal move at root:          reduce_time(0.10, "forced move")
+//   - PV+score stable >= 7 iters, d > 12: reduce_time(0.40, "easy move")
+
+void TimeManager::reduce_time(double factor, const char* reason) {
     if (infinite) return;
 
     int old_soft  = soft_limit_ms;
-    soft_limit_ms = int(soft_limit_ms * factor);
-    soft_limit_ms = std::min(soft_limit_ms, hard_limit_ms);
+    soft_limit_ms = std::max(int(soft_limit_ms * factor), MIN_TIME_MS);
     int headroom  = hard_limit_ms - soft_limit_ms;
 
     char t_now[32], t_old[32], t_new[32], t_hard[32], t_head[32];
@@ -236,7 +311,7 @@ void TimeManager::extend_time(double factor, const char* reason) {
     format_time(t_hard, sizeof(t_hard), hard_limit_ms);
     format_time(t_head, sizeof(t_head), headroom);
 
-    std::cout << "info string TM: extend x" << factor;
+    std::cout << "info string TM: reduce x" << factor;
     if (reason && reason[0]) std::cout << " (" << reason << ")";
     std::cout << " -- soft " << t_old << " -> " << t_new
               << " (hard " << t_hard << ", headroom " << t_head << ")"
@@ -245,18 +320,50 @@ void TimeManager::extend_time(double factor, const char* reason) {
 }
 
 // =============================================================================
+// CANCEL EASY MOVE
+// =============================================================================
+// Reverses a previous easy-move reduction before applying a time extension.
+// Multiplies soft_limit by 1/reduce_factor (the reciprocal of whatever factor
+// was used in the easy-move reduce_time call). Capped at hard_limit.
+//
+// Critically, this does NOT touch accumulated_ext_. A restoration is not a
+// real extension — it simply undoes the easy-move discount.
+
+void TimeManager::cancel_easy_move(double reduce_factor) {
+    if (infinite) return;
+
+    int old_soft  = soft_limit_ms;
+    soft_limit_ms = std::min(int(soft_limit_ms / reduce_factor), hard_limit_ms);
+    int headroom  = hard_limit_ms - soft_limit_ms;
+
+    char t_now[32], t_old[32], t_new[32], t_hard[32], t_head[32];
+    format_time(t_now,  sizeof(t_now),  elapsed_ms());
+    format_time(t_old,  sizeof(t_old),  old_soft);
+    format_time(t_new,  sizeof(t_new),  soft_limit_ms);
+    format_time(t_hard, sizeof(t_hard), hard_limit_ms);
+    format_time(t_head, sizeof(t_head), headroom);
+
+    std::cout << "info string TM: cancel easy"
+              << " -- soft " << t_old << " -> " << t_new
+              << " (hard " << t_hard << ", headroom " << t_head << ")"
+              << " [" << t_now << "]\n" << std::flush;
+}
+
+// =============================================================================
 // RESET
 // =============================================================================
 
 void TimeManager::reset() {
-    time_white    = 0;
-    time_black    = 0;
-    inc_white     = 0;
-    inc_black     = 0;
-    movetime      = 0;
-    depth_limit   = 0;
-    infinite      = false;
-    soft_limit_ms = 0;
-    hard_limit_ms = 0;
-    stop          = false;
+    time_white        = 0;
+    time_black        = 0;
+    inc_white         = 0;
+    inc_black         = 0;
+    movetime          = 0;
+    depth_limit       = 0;
+    infinite          = false;
+    soft_limit_ms     = 0;
+    hard_limit_ms     = 0;
+    accumulated_ext_  = 1.0;
+    raw_remaining_ms_ = 0;
+    stop              = false;
 }

@@ -1,24 +1,32 @@
 // =============================================================================
-// Last modified: 2026-03-12 12:30
+// Last modified: 2026-04-05 00:01
 // uci.cpp — UCI protocol implementation
 //
 // Facon 1.0 -- Oxido
-//   - Initial implementation: command dispatch loop, position parsing (startpos
-//     and FEN with move list), go command (wtime/btime/winc/binc/movetime/
-//     infinite/depth), setoption Hash, parse_move() via move generation.
+//   - Initial implementation: command dispatch loop, position parsing,
+//     go command, setoption Hash, parse_move() via move generation.
 //
 // Facon 1.2 -- Rojo Vivo
 //   - UCI threading: cmd_go() now launches the search in a dedicated
-//     std::thread (search_thread_) and returns immediately. The loop can
-//     continue reading stdin while the engine is searching. cmd_stop() sets
-//     TM.stop and joins the thread, which unwinds cleanly through the
-//     abort_search_ flag in Search. Previously "stop" was never received
-//     because cmd_go() blocked the entire UCI loop.
+//     std::thread (search_thread_) and returns immediately.
 //   - isatty()-gated prompt: the interactive "> " prompt is emitted to stderr
-//     only when stdin is a terminal (IS_INTERACTIVE()). Suppressed when
-//     launched by Arena, CuteChess, or fastchess to keep stdout clean.
+//     only when stdin is a terminal.
+//
+// Facon 1.3 -- Yunque
+//   - perft command: static helper perft() recursively counts leaf nodes.
+//     cmd_perft() handles "perft N" (total count + time) and
+//     "perft divide N" (per-move breakdown + total). Operates on a copy
+//     of board_ so the current position is not modified.
+//   - id name now uses FACON_VERSION from version.h instead of a hardcoded
+//     string. To change the version, edit CMakeLists.txt and rerun cmake.
+//   - Race condition fix in cmd_ucinewgame(): if the search thread is still
+//     active when "ucinewgame" arrives, it is joined before TT.clear() and
+//     board_.set_startpos() execute. Previously TT.clear() (std::memset)
+//     could race with TT.probe()/TT.store() in the search thread, causing
+//     undefined behavior.
 // =============================================================================
 
+#include "version.h"
 #include "uci.h"
 #include "search.h"
 #include "tt.h"
@@ -28,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <chrono>
 #ifdef _WIN32
 #  include <io.h>
 #  define IS_INTERACTIVE() (_isatty(_fileno(stdin)))
@@ -88,7 +97,7 @@ Move UCI::parse_move(const std::string& str) {
 // =============================================================================
 
 void UCI::cmd_uci() {
-    std::cout << "id name Facon 1.2 - Rojo Vivo\n";
+    std::cout << "id name Facon " << FACON_VERSION << "\n";
     std::cout << "id author Carlos M. Canavessi\n";
     std::cout << "\n";
     std::cout << "option name Hash type spin default 16 min 1 max 1024\n";
@@ -109,6 +118,15 @@ void UCI::cmd_isready() {
 // =============================================================================
 
 void UCI::cmd_ucinewgame() {
+    // Join the search thread before touching shared state. If "ucinewgame"
+    // arrives while the engine is still searching (e.g. after an abrupt
+    // "stop" + "ucinewgame" sequence), TT.clear() (which uses std::memset)
+    // would race with TT.probe() / TT.store() in the search thread, causing
+    // undefined behavior. Joining first guarantees the thread is done.
+    if (search_thread_.joinable()) {
+        TM.stop = true;
+        search_thread_.join();
+    }
     // Clear the TT: entries from a previous game can mislead the search
     TT.clear();
     board_.set_startpos();
@@ -235,6 +253,110 @@ void UCI::cmd_display() {
 }
 
 // =============================================================================
+// COMMAND: perft (not part of UCI spec, used for movegen validation)
+// =============================================================================
+// Syntax: perft <depth>
+//         perft divide <depth>
+//
+// Recursively counts leaf nodes to exactly the given depth without evaluating.
+// A single wrong node count at any depth indicates a movegen or make/unmake bug.
+//
+// Bulk-counting optimization at depth 1: count legal moves directly without
+// making each one, avoiding an extra make/unmake per leaf node.
+//
+// Known correct values from the starting position:
+//   depth 1:         20       depth 4:    197,281
+//   depth 2:        400       depth 5:  4,865,609
+//   depth 3:      8,902       depth 6: 119,060,324
+
+static uint64_t perft(Board& board, int depth) {
+    MoveList moves;
+    generate_all_moves(board, moves);
+
+    if (depth == 1) {
+        // Bulk-count: avoid make/unmake at the leaf level
+        uint64_t count = 0;
+        for (int i = 0; i < moves.count; i++)
+            if (board.is_legal(moves.moves[i])) count++;
+        return count;
+    }
+
+    uint64_t nodes = 0;
+    for (int i = 0; i < moves.count; i++) {
+        Move m = moves.moves[i];
+        if (!board.is_legal(m)) continue;
+        board.make_move(m);
+        nodes += perft(board, depth - 1);
+        board.unmake_move(m);
+    }
+    return nodes;
+}
+
+void UCI::cmd_perft(std::istringstream& ss) {
+    std::string token;
+    ss >> token;
+
+    bool divide = false;
+    int  depth  = 0;
+
+    if (token == "divide") {
+        divide = true;
+        if (!(ss >> depth)) { std::cout << "perft divide: missing depth\n" << std::flush; return; }
+    } else {
+        // Parse manually — exceptions are disabled in release builds (-fno-exceptions)
+        bool valid = !token.empty();
+        for (char c : token) if (c < '0' || c > '9') { valid = false; break; }
+        if (!valid) { std::cout << "perft: invalid depth\n" << std::flush; return; }
+        depth = 0;
+        for (char c : token) depth = depth * 10 + (c - '0');
+    }
+
+    if (depth <= 0) {
+        std::cout << "perft: depth must be >= 1\n" << std::flush;
+        return;
+    }
+
+    // Operate on a copy — the current position is not affected
+    Board board = board_;
+
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t total = 0;
+
+    if (divide) {
+        MoveList moves;
+        generate_all_moves(board, moves);
+        for (int i = 0; i < moves.count; i++) {
+            Move m = moves.moves[i];
+            if (!board.is_legal(m)) continue;
+            board.make_move(m);
+            uint64_t count = (depth == 1) ? 1 : perft(board, depth - 1);
+            board.unmake_move(m);
+            total += count;
+
+            // Print move in UCI format
+            Square from = from_sq(m), to = to_sq(m);
+            std::cout << char('a' + file_of(from)) << char('1' + rank_of(from))
+                      << char('a' + file_of(to))   << char('1' + rank_of(to));
+            if (move_type(m) == PROMOTION) {
+                const char promo[] = "nbrq";
+                std::cout << promo[promotion_type(m) - KNIGHT];
+            }
+            std::cout << ": " << count << "\n";
+        }
+    } else {
+        total = perft(board, depth);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    int  ms  = int(std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+
+    std::cout << "\nNodes: " << total << "\n";
+    std::cout << "Time:  " << ms << " ms";
+    if (ms > 0) std::cout << " (" << (total / ms) << "K nps)";
+    std::cout << "\n" << std::flush;
+}
+
+// =============================================================================
 // MAIN UCI LOOP
 // =============================================================================
 // Reads one command per line from stdin and dispatches to the appropriate
@@ -264,6 +386,7 @@ void UCI::loop() {
         else if (token == "stop")       cmd_stop();
         else if (token == "setoption")  cmd_setoption(ss);
         else if (token == "d")          cmd_display();
+        else if (token == "perft")      cmd_perft(ss);
         else if (token == "quit") {
             TM.stop = true;
             if (search_thread_.joinable())

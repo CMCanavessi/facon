@@ -1,29 +1,33 @@
 # =============================================================================
-# Last modified: 2026-03-11 23:49
+# Last modified: 2026-04-11 11:53
 # CMakeLists.txt — Build system for the Facón chess engine
 #
 # Changelog:
 #   1.2 — Replace global -static flag with selective static linking on Windows.
-#         The old -static flag triggered Windows Defender false positives due
-#         to cryptominer heuristics applied to fully-static PE binaries. The
-#         new approach statically links only the runtime libraries (libgcc,
-#         libstdc++, winpthread) while leaving the rest dynamic — no behavior
-#         change, no false positives, Linux build unaffected.
-#         Added src/version.rc: Windows version resource with FileDescription
-#         and CompanyName, shows metadata in Explorer -> Properties -> Details.
+#         Added src/version.rc: Windows version resource.
+#
+#   1.3 — Centralized version management via configure_file. A single source
+#         of truth: PROJECT_VERSION and FACON_CODENAME in this file control
+#         the binary name, the startup banner, the UCI id name, and the
+#         Windows version resource. To change the version, edit only the
+#         two lines marked below.
+#         Build directories renamed: build -> build-linux, for consistency
+#         with build-windows.
 #
 # QUICK START
 # -----------
 # Linux (portable binary):
-#   mkdir build && cd build
+#   mkdir build-linux && cd build-linux
 #   cmake .. -DCMAKE_BUILD_TYPE=Release
 #   make -j$(nproc)
 #
 # Linux (optimized for YOUR machine, not distributable):
+#   mkdir build-linux && cd build-linux
 #   cmake .. -DCMAKE_BUILD_TYPE=Release -DNATIVE=ON
 #   make -j$(nproc)
 #
 # Windows native (MSVC or MinGW):
+#   mkdir build-windows && cd build-windows
 #   cmake .. -DCMAKE_BUILD_TYPE=Release
 #   cmake --build . --config Release
 #
@@ -36,7 +40,39 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(facon VERSION 1.2 LANGUAGES CXX)
+# =============================================================================
+# VERSION — CHANGE THESE TWO LINES FOR EACH RELEASE
+# =============================================================================
+# During development: FACON_CODENAME = "dev"
+#   binary name = facon-1.3-dev,  UCI id = "Facon 1.3-dev"
+# For release:        FACON_CODENAME = "Yunque"
+#   binary name = facon-1.3,      UCI id = "Facon 1.3 - Yunque"
+
+project(facon VERSION 1.3 LANGUAGES CXX)
+set(FACON_CODENAME "Yunque")
+
+# =============================================================================
+# VERSION STRING CONSTRUCTION
+# =============================================================================
+
+if(FACON_CODENAME STREQUAL "dev")
+    set(FACON_VERSION_STRING "${PROJECT_VERSION}-dev")
+    set(FACON_OUTPUT_NAME    "facon-${PROJECT_VERSION}-dev")
+else()
+    set(FACON_VERSION_STRING "${PROJECT_VERSION} - ${FACON_CODENAME}")
+    set(FACON_OUTPUT_NAME    "facon-${PROJECT_VERSION}")
+endif()
+
+message(STATUS "Version string : ${FACON_VERSION_STRING}")
+message(STATUS "Output name    : ${FACON_OUTPUT_NAME}")
+
+# Generate version.h from version.h.in — included by main.cpp and uci.cpp.
+# Never edit the generated version.h directly; edit CMakeLists.txt instead.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/version.h"
+    @ONLY
+)
 
 # =============================================================================
 # OPTIONS
@@ -79,7 +115,10 @@ set(SOURCES
 )
 
 add_executable(facon ${SOURCES})
-set_target_properties(facon PROPERTIES OUTPUT_NAME "facon-1.2")
+set_target_properties(facon PROPERTIES OUTPUT_NAME "${FACON_OUTPUT_NAME}")
+
+# Make the generated version.h visible to all source files.
+target_include_directories(facon PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 # =============================================================================
 # COMPILER FLAGS
@@ -169,12 +208,6 @@ if(WIN32)
         NOMINMAX                  # Prevent Windows.h from defining min/max macros
     )
 
-    # Selective static linking: statically link only the C/C++ and pthread
-    # runtimes so the .exe runs without extra DLLs on any Windows machine.
-    # The old -static global flag caused Windows Defender false positives
-    # (cryptominer heuristic triggered by fully-static PE binaries). Selective
-    # linking avoids this with no impact on performance or compatibility.
-    # Linux build is unaffected — this block is WIN32-only.
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_link_options(facon PRIVATE
             -static-libgcc
@@ -183,9 +216,14 @@ if(WIN32)
         )
     endif()
 
-    # Windows version resource: shows metadata in Explorer -> Properties -> Details.
-    # FileDescription, CompanyName, and version fields are defined in version.rc.
-    target_sources(facon PRIVATE src/version.rc)
+    # Generate version.rc from version.rc.in and add to the build.
+    # The generated file contains the correct version numbers from PROJECT_VERSION.
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/version.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
+        @ONLY
+    )
+    target_sources(facon PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
 endif()
 
 # =============================================================================
@@ -193,7 +231,7 @@ endif()
 # =============================================================================
 
 message(STATUS "-------------------------------------------")
-message(STATUS "Facon ${PROJECT_VERSION}")
+message(STATUS "Facon ${FACON_VERSION_STRING}")
 message(STATUS "Build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "Compiler   : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "Platform   : ${CMAKE_SYSTEM_NAME}")

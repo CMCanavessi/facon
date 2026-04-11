@@ -1,9 +1,15 @@
 // =============================================================================
+// Last modified: 2026-03-27 00:00
 // bitboard.cpp — Bitboard initialization and attack table generation
 //
 // At startup, init_bitboards() fills every attack table used by the engine.
 // Magic numbers for sliding pieces are found automatically using a randomized
 // search — this guarantees correctness and avoids hardcoded values.
+//
+// Facon 1.3 — Yunque
+//   - isatty()-gated init message: "Initializing magic bitboards... done."
+//     now only prints when stderr is a terminal. Suppressed when launched
+//     by a GUI or fastchess, consistent with all other startup output.
 // =============================================================================
 
 #include "bitboard.h"
@@ -11,6 +17,13 @@
 #include <random>
 #include <vector>
 #include <algorithm>
+#ifdef _WIN32
+#  include <io.h>
+#  define IS_STDERR_INTERACTIVE() (_isatty(_fileno(stderr)))
+#else
+#  include <unistd.h>
+#  define IS_STDERR_INTERACTIVE() (isatty(fileno(stderr)))
+#endif
 
 // =============================================================================
 // TABLE DEFINITIONS
@@ -261,7 +274,7 @@ void init_bitboards() {
     // A fixed RNG seed makes the magic numbers reproducible across runs.
     // Each square gets a contiguous slice of the flat attack table.
     // -------------------------------------------------------------------------
-    std::cerr << "Initializing magic bitboards..." << std::flush;
+    if (IS_STDERR_INTERACTIVE()) std::cerr << "Initializing magic bitboards..." << std::flush;
     std::mt19937_64 rng(0xDEADBEEFCAFE0000ULL);
 
     Bitboard* b_ptr = bishop_attack_table;
@@ -274,7 +287,7 @@ void init_bitboards() {
         init_magic(s, r_ptr, /*is_bishop=*/false, rng);
         r_ptr += (1 << popcount(rook_mask(s)));
     }
-    std::cerr << " done.\n" << std::flush;
+    if (IS_STDERR_INTERACTIVE()) std::cerr << " done.\n" << std::flush;
 
     // -------------------------------------------------------------------------
     // 5. BETWEEN AND LINE TABLES

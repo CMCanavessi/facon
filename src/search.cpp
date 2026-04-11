@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-19 00:00
+// Last modified: 2026-04-11 11:53
 // search.cpp — Negamax alpha-beta search with iterative deepening
 //
 // Facon 1.1 — Herrumbre
@@ -121,18 +121,116 @@
 //     dropped the last position from tracking. Fixed by declaring
 //     seen[MAX_GAME_HISTORY + MAX_PLY + 2].
 //
+// Facon 1.3 — Yunque (post-gauntlet fixes)
+//
+//   MATE REDUCTION ONE-SHOT (bugfix):
+//     is_mate_score(last_score) is true on every iteration once a mate is
+//     found. reduce_time(0.05, "mate found") was firing every depth (13, 14,
+//     15...) causing x0.05^N collapse of the soft limit. Fixed by adding
+//     mate_reduction_applied_ bool: the reduction fires at most once per
+//     search, same pattern as easy_move_applied_.
+//
+//   COMPLEX POSITION TM PATH (time management):
+//     extend_time() now accepts the current depth. When depth >= EMERGENCY_DEPTH
+//     (25, an internal TM constant in timeman.cpp) and the new soft would exceed
+//     the hard limit, hard is raised to match soft (capped at 50% of remaining
+//     clock) instead of capping soft at hard. Both limits then rise together on
+//     subsequent extensions. Only triggered by real instability — a stable
+//     position at depth 25+ would have already fired the easy-move reduction.
+//     TM.raise_emergency_limit() removed; EMERGENCY_DEPTH removed from search.h.
+//
+//   ASPIRATION WINDOW FAIL-LOW FIX (correctness):
+//     The old fail-low handler set beta_asp = (alpha_asp + beta_asp) / 2,
+//     which squeezed the upper bound. When re-searching a position where the
+//     TT and LMR interactions cause the score to rebound, this artificial beta
+//     ceiling could trigger a fail-high, forcing a third search (yo-yo effect).
+//     Fixed: on fail-low, widen alpha only and leave beta untouched. On
+//     fail-high, widen beta only and leave alpha untouched. Standard impl.
+//
+//   ASPIRATION WINDOW VERBOSITY (observability):
+//     Fail-low and fail-high events emit "info string AW:" lines following
+//     the same style as TM messages: two-letter prefix, description with --
+//     separator, before->after window bounds, delta, elapsed timestamp.
+//     "ASP" renamed to "AW" for two-letter consistency with "TM".
+//
+//   SEEN[] GUARD FIX (bugfix):
+//     The seen[] array was declared with MAX_GAME_HISTORY + MAX_PLY + 2 slots
+//     (1154) in 1.2, but the insertion guard still used MAX_GAME_HISTORY + MAX_PLY
+//     (1152), stopping 2 entries early. Updated the guard to match the array size.
+//
+// Facon 1.3 — Yunque
+//
+//   DEPTH == 0 (prerequisite for LMR):
+//     Changed quiescence entry condition from depth <= 0 to depth == 0.
+//     With LMR, nodes can be called with a reduced depth that is already 0;
+//     we want to enter quiescence exactly at that point. A negative depth
+//     no longer silently enters quiescence — it causes a search hang,
+//     making depth bugs immediately detectable. All reduction call sites
+//     use std::max(0, reduced_depth) to ensure depth never goes negative.
+//
+//   NMP DEPTH FLOOR (bugfix):
+//     The NMP recursive call now uses std::max(0, depth - 1 - NMP_REDUCTION).
+//     Without this, at depth == NMP_MIN_DEPTH (3), NMP would pass depth -1.
+//     With depth == 0, that -1 no longer entered quiescence, causing
+//     infinite recursion and a hang starting at depth 4.
+//
+//   QUADRATIC EXTENSION SCALING:
+//     extend_time() calls in go() now pre-scale the factor by
+//     (depth^2 / EXTENSION_FULL_DEPTH^2). PV changes at depth 2-9 (normal,
+//     not instability) have near-zero effect; extensions at depth 14+
+//     apply the full factor. Cap: 2.0x total per move (in timeman.cpp).
+//
+//   EASY MOVE REDUCTION:
+//     reduce_time() is called after each completed iteration when the
+//     position is clearly resolved: mate found (x0.05), single legal move
+//     (x0.1), or PV+score stable for 7+ consecutive iterations at depth > 12
+//     (x EASY_REDUCE_FACTOR=0.40 — one-shot cut). The easy move trigger uses
+//     == not >= to fire exactly once. If instability is later detected (PV
+//     change or score drop), cancel_easy_move() restores the soft limit
+//     before applying the extension so the extension acts on the full value.
+//     stable_iters_ tracks the stable iteration count; resets on any change.
+//
+//   LMR (Late Move Reductions):
+//     Quiet moves that appear after the first LMR_MIN_MOVES legal moves at
+//     depth >= LMR_MIN_DEPTH are searched at reduced depth. Reduction formula:
+//     reduction = log(depth) * log(move_number) / LMR_DIVISOR, floored at 1.
+//     Skipped for: captures, en passant, promotions, killer moves, in check.
+//     If the reduced search raises alpha, the move is re-searched at full depth.
+//
+//   HISTORY HEURISTIC:
+//     history_[color][from][to] is incremented by depth^2 whenever a quiet
+//     move causes a beta cutoff. In move_score(), quiet moves return their
+//     history score instead of the flat ORDER_QUIET=0. This gives the move
+//     ordering meaningful differentiation among quiet moves — historically good
+//     moves rise in the list and are less likely to be LMR-reduced.
+//     Table is capped at HISTORY_MAX and reset at the start of each search.
+//
+//   ASPIRATION WINDOWS:
+//     Instead of searching with (-INFINITE, +INFINITE) at the start of each
+//     iteration, we use a narrow window centered on the previous iteration's
+//     score. If the search falls outside the window (fail-low or fail-high),
+//     we widen the window and re-search. Most iterations stay inside the
+//     window and save significant node count. Only applied from depth >= 4
+//     (below that the score is too unstable to trust for windowing).
+//     Also bypassed when the previous score is a mate score — a window of
+//     +/-50cp around a mate score can produce pathological re-searches.
+//     Initial window: +/- ASP_WINDOW (50cp). On each failure, the window
+//     doubles on the failing side until the score fits or the window reaches
+//     SCORE_INFINITE (full window, equivalent to no aspiration).
+//
 // Move ordering tiers (highest to lowest):
 //   1. TT move    — best move from a previous search at this position
 //   2. Captures   — ordered by MVV-LVA (Most Valuable Victim, Least Valuable Attacker)
 //   3. Promotions — treated similarly to captures
 //   4. Killer 1   — most recent quiet move that caused a beta cutoff at this ply
 //   5. Killer 2   — second killer move at this ply
-//   6. Quiet moves — history heuristic planned for 1.3; no further ordering here
+//   6. Quiet moves — ordered by history score (higher = caused more beta cutoffs)
 // =============================================================================
 
 #include "search.h"
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -186,7 +284,8 @@ constexpr int ORDER_TT_MOVE = 1000000;  // Always search TT move first
 constexpr int ORDER_CAPTURE =  100000;  // Base score for captures (+ MVV-LVA)
 constexpr int ORDER_KILLER1 =   90000;  // Most recent killer for this ply
 constexpr int ORDER_KILLER2 =   80000;  // Second killer for this ply
-constexpr int ORDER_QUIET   =       0;  // Quiet moves: history heuristic planned for 1.3
+// Quiet moves: scored by history_[color][from][to], range [0, HISTORY_MAX=50000].
+// This sits below ORDER_KILLER2 so killers always outrank history-scored quiets.
 
 // Score drop threshold for dynamic time extension.
 // If the best score drops by this many centipawns between iterations, the
@@ -217,7 +316,11 @@ int Search::move_score(const Board& board, Move m,
     if (m == killers_[ply][0]) return ORDER_KILLER1;
     if (m == killers_[ply][1]) return ORDER_KILLER2;
 
-    return ORDER_QUIET;
+    // History heuristic: quiet moves are ordered by their accumulated bonus.
+    // Moves that have caused beta cutoffs in previous searches of similar
+    // positions are scored higher and searched earlier.
+    Color us = board.side_to_move;
+    return history_[us][from_sq(m)][to_sq(m)];
 }
 
 void Search::sort_moves(const Board& board, MoveList& moves,
@@ -333,7 +436,10 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // that could leave pv_length_[ply] stale from a previous search iteration.
     pv_length_[ply] = 0;
 
-    // Time check: every 2048 nodes to minimize overhead.
+    // Time check: every 2048 negamax nodes to minimize overhead.
+    // Note: quiescence() has its own identical check using stats_.qnodes,
+    // because stats_.nodes is never incremented there — during deep tactical
+    // sequences the negamax counter is frozen and this check would never fire.
     // Set the abort flag instead of returning directly — this ensures every
     // level of the call stack sees the flag and returns, so all make_move()
     // calls are matched by unmake_move() calls and the board stays consistent.
@@ -373,8 +479,14 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     if (ply > 0 && (board.is_repetition() || board.half_move_clock >= 100))
         return SCORE_DRAW;
 
-    // At depth 0, resolve captures before evaluating
-    if (depth <= 0)
+    // At depth 0, drop into quiescence to resolve captures before evaluating.
+    // Must be == 0, not <= 0: with LMR a node can be called with a reduced
+    // depth of exactly 0, and we want to enter quiescence at that point.
+    // Using <= 0 would silently absorb negative depths from buggy reductions,
+    // masking the error. With == 0, a negative depth falls through to full
+    // search and causes an immediate, detectable hang. All reduction call
+    // sites use std::max(0, reduced_depth) to prevent negative depths.
+    if (depth == 0)
         return quiescence(board, alpha, beta, ply);
 
     // Hard depth limit to prevent stack overflow
@@ -475,7 +587,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         // for the move itself (like any other recursive call), and
         // -NMP_REDUCTION is the additional reduction that makes NMP efficient.
         Score null_score = -negamax(board, -beta, -beta + 1,
-                                    depth - 1 - NMP_REDUCTION, ply + 1, false);
+                                    std::max(0, depth - 1 - NMP_REDUCTION), ply + 1, false);
         board.unmake_null_move();
 
         if (abort_search_) return 0;
@@ -519,8 +631,39 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
             // during long iterations.
         }
 
+        // LMR eligibility: checked BEFORE make_move so piece_at(to_sq(m))
+        // correctly identifies captures (after make_move the captured piece
+        // is gone and the square holds the moving piece instead).
+        bool is_capture = (board.piece_at(to_sq(m)) != NO_PIECE)
+                       || (move_type(m) == EN_PASSANT);
+        bool is_killer  = (m == killers_[ply][0]) || (m == killers_[ply][1]);
+        bool do_lmr     = (depth >= LMR_MIN_DEPTH)
+                       && (legal_count > LMR_MIN_MOVES)
+                       && !in_check
+                       && !is_capture
+                       && (move_type(m) != PROMOTION)
+                       && !is_killer;
+
         board.make_move(m);
-        Score score = -negamax(board, -beta, -alpha, depth - 1, ply + 1);
+
+        Score score;
+        if (do_lmr) {
+            // Reduction formula: log(depth) * log(move_number) / LMR_DIVISOR.
+            // Floored at 1 and capped so reduced_depth >= 1 — we never LMR
+            // directly into quiescence (depth == 0).
+            int reduction     = int(std::log(double(depth)) * std::log(double(legal_count)) / LMR_DIVISOR);
+            reduction         = std::max(1, reduction);
+            int reduced_depth = std::max(1, depth - 1 - reduction);
+
+            // Zero-window search at reduced depth: only need to detect fail-low.
+            score = -negamax(board, -alpha - 1, -alpha, reduced_depth, ply + 1);
+
+            // If the reduced search did not fail low, re-search at full depth.
+            if (score > alpha)
+                score = -negamax(board, -beta, -alpha, depth - 1, ply + 1);
+        } else {
+            score = -negamax(board, -beta, -alpha, depth - 1, ply + 1);
+        }
         board.unmake_move(m);
 
         // If aborted mid-child, unwind without storing anything.
@@ -601,16 +744,22 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                 pv_length_[ply] = pv_length_[ply + 1] + 1;
 
                 if (alpha >= beta) {
-                    // Beta cutoff: store as killer if this is a quiet move.
-                    // Captures are already well-ordered by MVV-LVA so the
-                    // killer heuristic is only useful for quiet moves.
-                    // En passant and promotions are excluded — they are rare
-                    // enough that killer slots are better used for regular quiets.
+                    // Beta cutoff: update move ordering heuristics for quiet moves.
+                    // Captures are already well-ordered by MVV-LVA; killers and
+                    // history only apply to quiet moves (no capture, no promotion,
+                    // no en passant).
                     if (board.piece_at(to_sq(m)) == NO_PIECE
                         && move_type(m) != EN_PASSANT
                         && move_type(m) != PROMOTION)
                     {
                         store_killer(m, ply);
+
+                        // History bonus: depth^2 so deeper cutoffs count more.
+                        // Capped at HISTORY_MAX to prevent scores from drifting
+                        // above ORDER_KILLER2 (which would break the ordering tier).
+                        int bonus = depth * depth;
+                        int& entry = history_[board.side_to_move][from_sq(m)][to_sq(m)];
+                        entry = std::min(entry + bonus, HISTORY_MAX);
                     }
 
                     // Store as lower bound: the real score may be even higher
@@ -667,17 +816,21 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 //   Both extensions can apply in the same iteration (multiplicative).
 
 SearchResult Search::go(Board& board) {
-    stats_          = SearchStats{};
-    abort_search_   = false;
-    last_output_ms_ = 0;
+    stats_             = SearchStats{};
+    abort_search_      = false;
+    last_output_ms_    = 0;
     last_heartbeat_ms_ = 0;
-    current_depth_  = 0;
-    root_move_count_= 0;
-    prev_best_move_ = MOVE_NONE;
+    current_depth_     = 0;
+    root_move_count_   = 0;
+    prev_best_move_    = MOVE_NONE;
+    stable_iters_             = 0;
+    easy_move_applied_        = false;
+    mate_reduction_applied_   = false;
 
-    // Clear killer table: killers from a previous position are irrelevant
-    // and can mislead move ordering for the new position.
+    // Clear killer and history tables: entries from a previous position are
+    // irrelevant and can mislead move ordering for the new position.
     std::memset(killers_, 0, sizeof(killers_));
+    std::memset(history_, 0, sizeof(history_));
 
     TM.start(board.side_to_move);
 
@@ -727,7 +880,72 @@ SearchResult Search::go(Board& board) {
                 if (board.is_legal(root_moves.moves[i])) root_move_count_++;
         }
 
-        Score score = negamax(board, -SCORE_INFINITE, SCORE_INFINITE, depth, 0);
+        // Aspiration windows: search with a narrow window around the previous
+        // iteration's score. Saves nodes when the true score is close to the
+        // expected value. On failure, widen the window on the failing side and
+        // re-search. Only applied at depth >= 4 — below that scores are too
+        // unstable to narrow around.
+        Score score;
+        if (depth < 4 || last_score == 0 || is_mate_score(last_score)) {
+            // Full window for early depths, no prior score, or when the previous
+            // score was a mate. Mate scores near +/-SCORE_MATE would make the
+            // window wrap around or sit entirely outside the valid range, causing
+            // unnecessary re-searches or pathological behavior.
+            score = negamax(board, -SCORE_INFINITE, SCORE_INFINITE, depth, 0);
+        } else {
+            // Start with a narrow window centered on the previous score.
+            Score alpha_asp = last_score - ASP_WINDOW;
+            Score beta_asp  = last_score + ASP_WINDOW;
+            Score delta     = ASP_WINDOW;
+
+            while (true) {
+                score = negamax(board, alpha_asp, beta_asp, depth, 0);
+
+                // Abort propagation: if the search was aborted, exit immediately.
+                if (abort_search_) break;
+
+                if (score <= alpha_asp) {
+                    // Fail-low: score is below our window. Widen on the low side only.
+                    // Do NOT modify beta_asp — squeezing the upper bound risks an
+                    // artificial fail-high on re-search (yo-yo effect) when TT and
+                    // LMR interactions cause the score to rebound above the narrowed
+                    // ceiling. Standard: only ever widen in the failing direction.
+                    int old_alpha = alpha_asp;
+                    alpha_asp = std::max(score - delta, -SCORE_INFINITE);
+                    delta    *= 2;
+
+                    char t_now[32];
+                    { int64_t ms=TM.elapsed_ms(); int64_t s=(ms/1000)%60,m=(ms/60000)%60,h=ms/3600000,ms3=ms%1000;
+                      std::snprintf(t_now,sizeof(t_now),"%lld:%02lld:%02lld,%03lld",(long long)h,(long long)m,(long long)s,(long long)ms3); }
+                    std::cout << "info string AW: fail-low"
+                              << " depth " << depth
+                              << " score " << (score >= 0 ? "+" : "") << score << "cp"
+                              << " -- window [" << old_alpha << ", " << beta_asp << "]"
+                              << " -> [" << alpha_asp << ", " << beta_asp << "]"
+                              << " delta " << delta
+                              << " [" << t_now << "]\n" << std::flush;
+                } else if (score >= beta_asp) {
+                    // Fail-high: score is above our window. Widen on the high side only.
+                    int old_beta = beta_asp;
+                    beta_asp = std::min(score + delta, SCORE_INFINITE);
+                    delta   *= 2;
+
+                    char t_now[32];
+                    { int64_t ms=TM.elapsed_ms(); int64_t s=(ms/1000)%60,m=(ms/60000)%60,h=ms/3600000,ms3=ms%1000;
+                      std::snprintf(t_now,sizeof(t_now),"%lld:%02lld:%02lld,%03lld",(long long)h,(long long)m,(long long)s,(long long)ms3); }
+                    std::cout << "info string AW: fail-high"
+                              << " depth " << depth
+                              << " score " << (score >= 0 ? "+" : "") << score << "cp"
+                              << " -- window [" << alpha_asp << ", " << old_beta << "]"
+                              << " -> [" << alpha_asp << ", " << beta_asp << "]"
+                              << " delta " << delta
+                              << " [" << t_now << "]\n" << std::flush;
+                } else {
+                    // Score is inside the window — search is complete for this depth.
+                    break;
+                }
+            }
+        }
 
         // Discard incomplete results: if aborted mid-iteration the score and
         // root_best_move_ are unreliable — keep the last fully completed result.
@@ -811,7 +1029,7 @@ SearchResult Search::go(Board& board) {
                 }
                 if (repeated) break;
 
-                if (seen_count < MAX_GAME_HISTORY + MAX_PLY)
+                if (seen_count < MAX_GAME_HISTORY + MAX_PLY + 2)
                     seen[seen_count++] = pv_board.hash;
 
                 Square from = from_sq(pv_move);
@@ -845,19 +1063,72 @@ SearchResult Search::go(Board& board) {
         std::cout << "\n" << std::flush;
         last_output_ms_    = elapsed;
         last_heartbeat_ms_ = elapsed;  // end-of-iteration info line counts as substantive output
-        // ---------------------------------------------------------------------
         // Check the soft limit after each completed iteration.
         if (TM.soft_stop()) break;
 
-        // PV instability: the best move changed between iterations.
-        // The engine is reconsidering its top choice — give it more time.
-        if (depth > 1 && last_move != prev_move && last_move != MOVE_NONE)
-            TM.extend_time(1.5, "PV change");
+        // -------------------------------------------------------------------------
+        // DYNAMIC TIME MANAGEMENT
+        // -------------------------------------------------------------------------
+        // Quadratic depth scaling: scale extension factors by
+        // (depth^2 / EXTENSION_FULL_DEPTH^2) so that PV changes at depth 2-9
+        // (normal search behavior) have near-zero effect on the soft limit,
+        // while extensions at the engine's operating depth (14+) apply the
+        // full factor. At EXTENSION_FULL_DEPTH the scale is exactly 1.0.
+        double depth_scale = std::min(1.0,
+            double(depth) * double(depth) /
+            double(EXTENSION_FULL_DEPTH) / double(EXTENSION_FULL_DEPTH));
 
-        // Score drop: the evaluation fell significantly from the previous
-        // iteration. Extra time helps find the best defensive response.
-        if (depth > 1 && (prev_score - last_score) >= SCORE_DROP_THRESHOLD)
-            TM.extend_time(1.25, "score drop");
+        // PV instability: best move changed between iterations.
+        // Score drop: evaluation fell significantly.
+        // Before applying any extension: if an easy-move reduction was applied
+        // earlier this move, cancel it first so the extension acts on the
+        // un-discounted soft limit. Otherwise extending 1.5x on a value that
+        // is already 40% of the original gives only 0.60x of the original —
+        // the extension is nearly useless.
+        if (depth > 1 && last_move != prev_move && last_move != MOVE_NONE) {
+            if (easy_move_applied_) {
+                TM.cancel_easy_move(EASY_REDUCE_FACTOR);
+                easy_move_applied_ = false;
+            }
+            TM.extend_time(1.0 + 0.5 * depth_scale, "PV change", depth);
+        }
+
+        if (depth > 1 && (prev_score - last_score) >= SCORE_DROP_THRESHOLD) {
+            if (easy_move_applied_) {
+                TM.cancel_easy_move(EASY_REDUCE_FACTOR);
+                easy_move_applied_ = false;
+            }
+            TM.extend_time(1.0 + 0.25 * depth_scale, "score drop", depth);
+        }
+
+        // Easy move reductions: only when the position is genuinely trivial.
+        // Fires ONCE (== not >=) — one-shot, cannot compound.
+        // Conditions are deliberately strict: same PV for 7 iterations,
+        // score delta < 3cp, and depth > 12 (engine is well into its
+        // operating range before we declare a position easy).
+        if (depth > 12) {
+            if (is_mate_score(last_score) && !mate_reduction_applied_) {
+                // One-shot: fires at most once per search. Without this guard,
+                // is_mate_score() is true on every subsequent iteration, and
+                // x0.05 applied repeatedly collapses the soft limit to near zero.
+                TM.reduce_time(0.05, "mate found");
+                mate_reduction_applied_ = true;
+            } else if (!is_mate_score(last_score) && root_move_count_ == 1) {
+                TM.reduce_time(0.10, "forced move");
+            } else if (!is_mate_score(last_score)) {
+                bool move_stable  = (last_move == prev_move && last_move != MOVE_NONE);
+                bool score_stable = (std::abs(last_score - prev_score) < 3);
+                if (move_stable && score_stable)
+                    stable_iters_++;
+                else
+                    stable_iters_ = 0;
+                // Fires exactly once at the threshold.
+                if (stable_iters_ == 7) {
+                    TM.reduce_time(EASY_REDUCE_FACTOR, "easy move");
+                    easy_move_applied_ = true;
+                }
+            }
+        }
 
         // Save state for the next iteration's comparisons
         prev_move       = last_move;
