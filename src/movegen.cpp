@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-04-12 19:15
 // movegen.cpp — Pseudo-legal move generation
 //
 // Generates moves piece by piece in this order:
@@ -12,6 +13,15 @@
 // All generated moves are pseudo-legal: they respect piece movement rules but
 // may leave the king in check. The caller must verify legality with
 // board.is_legal() before making each move.
+//
+// Facon 1.4 -- Hoja
+//   - Quiet queen promotions in generate_captures(): a pawn pushing to the
+//     8th rank without capturing gains a queen for free — as significant as
+//     a capture. Previously invisible to quiescence search, causing the
+//     engine to miss free queens on the horizon. Only queen promotion is
+//     generated (underpromotions are nearly always inferior and would add
+//     noise to qsearch). Full move generation (generate_all_moves) is
+//     unchanged — it still generates all four promotion types.
 // =============================================================================
 
 #include "movegen.h"
@@ -89,6 +99,7 @@ static void generate_pawn_moves(const Board& board, MoveList& moves,
         }
 
         // Quiet promotion: pawn on 7th/2nd rank pushes to the last rank
+        // All four promotion types are generated in the full move list.
         Bitboard promo_push = (us == WHITE)
             ? shift_north(promo_pawns) & ~occ
             : shift_south(promo_pawns) & ~occ;
@@ -97,6 +108,22 @@ static void generate_pawn_moves(const Board& board, MoveList& moves,
             Square to   = pop_lsb(promo_push);
             Square from = (us == WHITE) ? Square(to - 8) : Square(to + 8);
             add_promotions(moves, from, to);
+        }
+    } else {
+        // Quiet queen promotion only: in captures-only mode (quiescence),
+        // a pawn pushing to the 8th rank without capturing gains a queen for
+        // free — this is as significant as a capture and must be visible to
+        // qsearch. Only queen promotion is generated here; underpromotions
+        // (rook, bishop, knight) are nearly always inferior and would add
+        // noise to the quiescence move list without benefit.
+        Bitboard promo_push = (us == WHITE)
+            ? shift_north(promo_pawns) & ~occ
+            : shift_south(promo_pawns) & ~occ;
+
+        while (promo_push) {
+            Square to   = pop_lsb(promo_push);
+            Square from = (us == WHITE) ? Square(to - 8) : Square(to + 8);
+            moves.add(make_promotion(from, to, QUEEN));
         }
     }
 

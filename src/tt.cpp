@@ -1,6 +1,13 @@
 // =============================================================================
-// Last modified: 2026-03-11 23:49
+// Last modified: 2026-04-19 02:02
 // tt.cpp — Transposition Table implementation
+//
+// Facon 1.4 -- Hoja
+//   - Depth-preferred replacement: store() now refuses to overwrite a deeper
+//     entry for a different position. Only overwrites if the slot is empty,
+//     the hash matches (same position, newer data), or the new depth >=
+//     the stored depth. Prevents shallow searches from evicting expensive
+//     deep results.
 // =============================================================================
 
 #include "tt.h"
@@ -61,6 +68,23 @@ void TranspositionTable::store(uint64_t hash, Move move, Score score,
                                 int depth, BoundType bound, int ply) {
     TTEntry& entry = table_[index(hash)];
 
+    // Depth-preferred replacement: only overwrite an existing entry if at
+    // least one of these conditions holds:
+    //   1. The slot is empty (BOUND_NONE) — nothing to preserve.
+    //   2. Same position (hash match) — newer data for the same position is
+    //      always more current, even at shallower depth.
+    //   3. New depth >= stored depth — deeper search is more valuable.
+    //
+    // This prevents a shallow search at depth 2 from evicting a deep result
+    // at depth 15 for a different position. The cost: some shallow entries
+    // for new positions are lost when a deep entry occupies the slot. This
+    // is the right tradeoff — deep results are expensive to recompute.
+    if (entry.bound != BOUND_NONE && entry.hash != hash
+        && depth < int(entry.depth))
+    {
+        return;  // Refuse to overwrite a deeper entry for a different position
+    }
+
     // Move preservation: if the new result has no best move but we already
     // have one stored for this exact position, keep the old move.
     // This avoids losing the PV move when storing a lower-quality result.
@@ -70,7 +94,7 @@ void TranspositionTable::store(uint64_t hash, Move move, Score score,
     entry.hash  = hash;
     entry.move  = move;
     entry.score = int16_t(score_to_tt(score, ply));
-    entry.depth = int8_t(depth);
+    entry.depth = uint8_t(depth);
     entry.bound = bound;
 }
 

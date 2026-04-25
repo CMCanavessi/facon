@@ -1,4 +1,5 @@
 // =============================================================================
+// Last modified: 2026-04-12 19:15
 // movegen.h — Move generation
 //
 // Generates all pseudo-legal moves for a given position.
@@ -15,6 +16,11 @@
 //       ...
 //       board.unmake_move(m);
 //   }
+//
+// Facon 1.4 -- Hoja
+//   - generate_captures() now includes quiet queen promotions (pawn push
+//     to last rank without capturing). Previously these were only generated
+//     by generate_all_moves(), making free queens invisible to qsearch.
 // =============================================================================
 
 #pragma once
@@ -54,9 +60,10 @@ struct MoveList {
 // This is the main function called from the search.
 void generate_all_moves(const Board& board, MoveList& moves);
 
-// Generate only "noisy" moves: captures and promotion captures (all four
-// promotion pieces). Quiet promotions (pawn push to last rank without
-// capturing) are intentionally excluded — they are rare and the search
-// handles them at full depth in generate_all_moves.
+// Generate "noisy" moves: captures, promotion captures (all four promotion
+// pieces), en passant, and quiet queen promotions (pawn push to the last
+// rank without capturing — gaining a queen for free is as significant as
+// a capture). Only queen promotion is generated for quiet pushes;
+// underpromotions are nearly always inferior and would add noise.
 // Used in quiescence search to resolve tactical sequences.
 void generate_captures(const Board& board, MoveList& moves);

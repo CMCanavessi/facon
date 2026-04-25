@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-12 12:30
+// Last modified: 2026-04-18 21:02
 // board.h — Chess board state representation
 //
 // The Board struct holds the complete state of a chess position and provides
@@ -8,6 +8,14 @@
 // We use two redundant representations kept in sync at all times:
 //   1. Bitboards: fast for bulk operations (attacks, move generation)
 //   2. Piece array: fast for "what piece is on square X?" queries
+//
+// Facon 1.3 -- Yunque
+//   - move_to_san(): castling check/mate fix.
+//
+// Facon 1.4 -- Hoja
+//   - all_attackers_to(Square, Bitboard occ): returns all attackers of both
+//     colors to a square using a given occupancy. Required by SEE to discover
+//     x-ray attackers as pieces are removed from the exchange sequence.
 // =============================================================================
 
 #pragma once
@@ -160,6 +168,12 @@ struct Board {
 
     // Return a bitboard of all pieces of color 'c' that attack square 's'
     Bitboard attackers_to(Square s, Color c) const;
+
+    // Return a bitboard of ALL pieces (both colors) that attack square 's',
+    // using the given occupancy instead of the board's actual occupancy.
+    // Essential for SEE: as pieces are removed from the exchange, x-ray
+    // attackers (bishops/rooks/queens behind them) become visible.
+    Bitboard all_attackers_to(Square s, Bitboard occ) const;
 
     // Return true if the side to move's king is currently in check
     bool in_check() const;

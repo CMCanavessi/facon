@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-11 11:53
+// Last modified: 2026-04-18 21:02
 // board.cpp — Board state implementation: FEN parsing, make/unmake, queries
 //
 // Facon 1.0 -- Oxido
@@ -37,6 +37,11 @@
 //     detection at the end of the function. Castling moves that deliver
 //     check or mate were missing the + or # suffix. Fixed by setting san
 //     instead of returning, so the check/mate block runs for all move types.
+//
+// Facon 1.4 -- Hoja
+//   - all_attackers_to(Square, Bitboard occ): returns all attackers of both
+//     colors to a square using a given occupancy. Sliders (bishop, rook,
+//     queen) use the provided occ for x-ray discovery. Used by SEE.
 // =============================================================================
 
 #include "board.h"
@@ -294,6 +299,21 @@ Bitboard Board::attackers_to(Square s, Color c) const {
     att |= bishop_attack(s, occ) & (piece_bb(c, BISHOP) | piece_bb(c, QUEEN));
     att |= rook_attack(s, occ)   & (piece_bb(c, ROOK)   | piece_bb(c, QUEEN));
     return att;
+}
+
+// Returns a bitboard of ALL pieces (both colors) that attack square 's',
+// using the provided occupancy for slider computation. Pawns, knights, and
+// kings use fixed attack patterns (not affected by occupancy); sliders
+// (bishops, rooks, queens) use the given occ for x-ray discovery.
+// Used by SEE: as pieces are removed from the exchange, the occupancy
+// shrinks and sliders behind the removed piece become visible.
+Bitboard Board::all_attackers_to(Square s, Bitboard occ) const {
+    return (pawn_attack(BLACK, s)  & piece_bb(WHITE, PAWN))
+         | (pawn_attack(WHITE, s)  & piece_bb(BLACK, PAWN))
+         | (knight_attack(s)       & (pieces[KNIGHT]))
+         | (king_attack(s)         & (pieces[KING]))
+         | (bishop_attack(s, occ)  & (pieces[BISHOP] | pieces[QUEEN]))
+         | (rook_attack(s, occ)    & (pieces[ROOK]   | pieces[QUEEN]));
 }
 
 // Returns a bitboard of ALL squares attacked by color 'c'.

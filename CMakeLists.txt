@@ -1,5 +1,5 @@
 # =============================================================================
-# Last modified: 2026-04-11 11:53
+# Last modified: 2026-04-24 08:53
 # CMakeLists.txt — Build system for the Facón chess engine
 #
 # Changelog:
@@ -13,6 +13,8 @@
 #         two lines marked below.
 #         Build directories renamed: build -> build-linux, for consistency
 #         with build-windows.
+#
+#   1.4 — Version bumped to 1.4-dev. Codename "Hoja" for release.
 #
 # QUICK START
 # -----------
@@ -44,20 +46,20 @@ cmake_minimum_required(VERSION 3.16)
 # VERSION — CHANGE THESE TWO LINES FOR EACH RELEASE
 # =============================================================================
 # During development: FACON_CODENAME = "dev"
-#   binary name = facon-1.3-dev,  UCI id = "Facon 1.3-dev"
-# For release:        FACON_CODENAME = "Yunque"
-#   binary name = facon-1.3,      UCI id = "Facon 1.3 - Yunque"
+#   binary name = facon-1.4-dev,  UCI id = "Facon 1.4-dev"
+# For release:        FACON_CODENAME = "Hoja"
+#   binary name = facon-1.4,      UCI id = "Facon 1.4 - Hoja"
 
-project(facon VERSION 1.3 LANGUAGES CXX)
-set(FACON_CODENAME "Yunque")
+project(facon VERSION 1.4 LANGUAGES CXX)
+set(FACON_CODENAME "Hoja")
 
 # =============================================================================
 # VERSION STRING CONSTRUCTION
 # =============================================================================
 
-if(FACON_CODENAME STREQUAL "dev")
-    set(FACON_VERSION_STRING "${PROJECT_VERSION}-dev")
-    set(FACON_OUTPUT_NAME    "facon-${PROJECT_VERSION}-dev")
+if(FACON_CODENAME MATCHES "^dev")
+    set(FACON_VERSION_STRING "${PROJECT_VERSION}-${FACON_CODENAME}")
+    set(FACON_OUTPUT_NAME    "facon-${PROJECT_VERSION}-${FACON_CODENAME}")
 else()
     set(FACON_VERSION_STRING "${PROJECT_VERSION} - ${FACON_CODENAME}")
     set(FACON_OUTPUT_NAME    "facon-${PROJECT_VERSION}")
@@ -78,8 +80,14 @@ configure_file(
 # OPTIONS
 # =============================================================================
 
-option(NATIVE "Optimize for the current CPU (-march=native). Not distributable." OFF)
-option(LTO    "Enable Link Time Optimization. May slow down compilation."        ON)
+option(NATIVE      "Optimize for the current CPU (-march=native). Not distributable." OFF)
+option(LTO         "Enable Link Time Optimization. May slow down compilation."        ON)
+option(FACON_DEBUG "Enable diagnostic counters (LMR/NMP stats per iteration)."        OFF)
+
+if(FACON_DEBUG)
+    add_compile_definitions(FACON_DEBUG)
+    message(STATUS "FACON_DEBUG: enabled (diagnostic counters active)")
+endif()
 
 # =============================================================================
 # C++ STANDARD
@@ -237,4 +245,5 @@ message(STATUS "Compiler   : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSI
 message(STATUS "Platform   : ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Native CPU : ${NATIVE}")
 message(STATUS "LTO        : ${LTO}")
+message(STATUS "Debug stats: ${FACON_DEBUG}")
 message(STATUS "-------------------------------------------")

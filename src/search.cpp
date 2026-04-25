@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-11 11:53
+// Last modified: 2026-04-19 15:56
 // search.cpp — Negamax alpha-beta search with iterative deepening
 //
 // Facon 1.1 — Herrumbre
@@ -128,7 +128,7 @@
 //     found. reduce_time(0.05, "mate found") was firing every depth (13, 14,
 //     15...) causing x0.05^N collapse of the soft limit. Fixed by adding
 //     mate_reduction_applied_ bool: the reduction fires at most once per
-//     search, same pattern as easy_move_applied_.
+//     search, same pattern as easy_cumulative_.
 //
 //   COMPLEX POSITION TM PATH (time management):
 //     extend_time() now accepts the current depth. When depth >= EMERGENCY_DEPTH
@@ -225,6 +225,62 @@
 //   4. Killer 1   — most recent quiet move that caused a beta cutoff at this ply
 //   5. Killer 2   — second killer move at this ply
 //   6. Quiet moves — ordered by history score (higher = caused more beta cutoffs)
+//
+// Facon 1.4 -- Hoja
+//
+//   MOVE_TO_UCI() DEDUPLICATION (cleanup):
+//     The static move_to_uci() helper was duplicated in search.cpp and uci.cpp.
+//     Moved to types.h as an inline function. Both files now use the shared
+//     version via #include "types.h" (already included via search.h / uci.h).
+//
+//   LMR TABLE PRECALCULATION (speedup):
+//     The per-move reduction formula log(depth)*log(move)/LMR_DIVISOR is now
+//     precomputed into LMR_table[MAX_PLY][MAX_MOVES] at startup. The hot path
+//     in negamax replaces two log() calls and a division with a single array
+//     lookup. Same formula, same results — pure speedup.
+//
+//   MOVE SCORES COMPUTED ONCE (speedup):
+//     sort_moves() previously called move_score() on every comparison in
+//     the selection sort — O(n^2) calls for n moves. Now scores are computed
+//     once into a parallel array (O(n) calls), and the sort operates on the
+//     precomputed scores. The scores array is swapped in parallel with moves.
+//
+//   MAKE/UNMAKE LEGALITY (speedup):
+//     negamax() and quiescence() no longer call is_legal() (which copies the
+//     entire Board struct ~700 bytes per pseudo-legal move). Instead, the move
+//     is made on the real board, the king-in-check test is performed directly,
+//     and if the move is illegal it is unmade. Legal moves proceed to search
+//     and are unmade after. Eliminates ~30 Board copies per node.
+//     is_legal() is unchanged and still used by non-hot-path callers (perft,
+//     move_to_san, PV walk, root move counting, parse_move).
+//
+//   FACON_DEBUG DIAGNOSTIC COUNTERS:
+//     When compiled with -DFACON_DEBUG, LMR/NMP/TT counters are incremented
+//     in the search and reported via "info string ST:" after each completed
+//     iteration. Zero cost in release builds — all behind #ifdef.
+//
+//   CHECK EXTENSION:
+//     When the side to move is in check, depth is extended by 1. Being in
+//     check is a forcing situation with very few legal responses. Dropping
+//     into quiescence while in check would miss critical evasions (qsearch
+//     only considers captures). Applied before the depth==0 quiescence
+//     entry, so a node at depth 0 in check gets extended to depth 1.
+//
+//   STATIC EXCHANGE EVALUATION (SEE):
+//     see(board, m) simulates the full capture sequence on the target square
+//     and returns the material gain/loss. Used in qsearch to skip losing
+//     captures (SEE < 0), preventing the engine from wasting time on lines
+//     like QxP where the pawn is defended.
+//
+//   REVERSE FUTILITY PRUNING (RFP):
+//     At shallow depths (1-3), if the static eval minus a margin already
+//     exceeds beta, the node is pruned entirely — like a cheaper NMP without
+//     the null move search. Margin: 100cp per depth level.
+//
+//   MOVE-LEVEL FUTILITY PRUNING:
+//     At depth 1-2, quiet moves (non-capture, non-promotion) are skipped if
+//     static_eval + margin is below alpha. At least one legal move is always
+//     searched to detect checkmate/stalemate. Margin: 150cp per depth level.
 // =============================================================================
 
 #include "search.h"
@@ -237,27 +293,123 @@
 // Global instance
 Search Searcher;
 
-// =============================================================================
-// HELPERS
-// =============================================================================
+// LMR reduction table — precomputed at startup by init_lmr_table().
+int LMR_table[MAX_PLY][MAX_MOVES];
 
-// Convert a Move to its UCI string (e.g. "e2e4", "e7e8q").
-// Duplicated from uci.cpp to keep search.cpp self-contained — search needs
-// this for currmove and new-best output without depending on the UCI layer.
-static std::string move_to_uci(Move m) {
-    if (m == MOVE_NONE) return "0000";
+void init_lmr_table() {
+    // LMR_DIVISOR (2.25) is defined as Search::LMR_DIVISOR in search.h.
+    // Hardcoded here because the init function is not a class member.
+    // If LMR_DIVISOR changes, update this value too.
+    constexpr double divisor = 2.25;
+    for (int depth = 0; depth < MAX_PLY; depth++) {
+        for (int move = 0; move < MAX_MOVES; move++) {
+            if (depth < 1 || move < 1)
+                LMR_table[depth][move] = 0;
+            else
+                LMR_table[depth][move] = int(std::log(double(depth))
+                                           * std::log(double(move))
+                                           / divisor);
+        }
+    }
+}
+
+// =============================================================================
+// STATIC EXCHANGE EVALUATION (SEE)
+// =============================================================================
+// Evaluates a capture by simulating the full exchange sequence on the target
+// square. Returns the material gain (positive) or loss (negative) from the
+// perspective of the side making the initial capture.
+//
+// Algorithm:
+//   1. Record the initial capture value in gain[0].
+//   2. Remove the moving piece from occupancy (may reveal x-ray attackers).
+//   3. Find the cheapest attacker of the defending side on the target square.
+//   4. gain[d] = value_of_piece_just_captured - gain[d-1]  (negamax-style).
+//   5. Remove attacker, recompute attackers, switch sides. Repeat.
+//   6. Propagate backwards: at each step, the side can choose NOT to recapture
+//      if it would make them worse off.
+//
+// Used in quiescence search to prune losing captures (SEE < 0) and in move
+// ordering to distinguish good captures from bad ones.
+
+static int see(const Board& board, Move m) {
     Square from = from_sq(m);
     Square to   = to_sq(m);
-    std::string s;
-    s += char('a' + file_of(from));
-    s += char('1' + rank_of(from));
-    s += char('a' + file_of(to));
-    s += char('1' + rank_of(to));
-    if (move_type(m) == PROMOTION) {
-        const char promo[] = "nbrq";
-        s += promo[promotion_type(m) - KNIGHT];
+
+    // Determine the initial capture value and attacker piece type
+    int gain[64];
+    int d = 0;
+
+    PieceType attacker_type = type_of(board.piece_at(from));
+
+    if (move_type(m) == EN_PASSANT) {
+        gain[d] = PIECE_VALUE[PAWN];
+    } else if (move_type(m) == PROMOTION) {
+        Piece victim = board.piece_at(to);
+        gain[d] = (victim != NO_PIECE ? PIECE_VALUE[type_of(victim)] : 0)
+                + PIECE_VALUE[promotion_type(m)] - PIECE_VALUE[PAWN];
+        attacker_type = promotion_type(m);
+    } else {
+        Piece victim = board.piece_at(to);
+        if (victim == NO_PIECE) return 0;
+        gain[d] = PIECE_VALUE[type_of(victim)];
     }
-    return s;
+
+    // Build occupancy with the moving piece removed from its origin
+    Bitboard occ = board.occupancy();
+    occ ^= (1ULL << from);
+
+    // For en passant, also remove the captured pawn from occupancy
+    if (move_type(m) == EN_PASSANT) {
+        Square ep_captured = (board.side_to_move == WHITE)
+                           ? Square(to - 8) : Square(to + 8);
+        occ ^= (1ULL << ep_captured);
+    }
+
+    // Get all attackers to the target square with updated occupancy
+    Bitboard attackers = board.all_attackers_to(to, occ) & occ;
+
+    // The opponent recaptures first
+    Color side = ~board.side_to_move;
+
+    while (true) {
+        d++;
+
+        // Find attackers belonging to the current side
+        Bitboard side_attackers = attackers & board.by_color[side];
+        if (!side_attackers) break;
+
+        // Find the cheapest attacker (PAWN < KNIGHT < BISHOP < ROOK < QUEEN < KING)
+        PieceType pt;
+        for (pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) {
+            if (side_attackers & board.pieces[pt]) break;
+        }
+
+        // Negamax gain: what we capture minus what the previous side gained
+        gain[d] = PIECE_VALUE[attacker_type] - gain[d - 1];
+
+        // Pruning: if even capturing for free can't beat the current best,
+        // stop early (the side to move will choose not to recapture)
+        if (std::max(-gain[d - 1], gain[d]) < 0) break;
+
+        attacker_type = pt;
+
+        // Remove the cheapest attacker from occupancy (x-ray discovery)
+        occ ^= (1ULL << lsb(side_attackers & board.pieces[pt]));
+
+        // Recompute attackers with the new occupancy
+        attackers = board.all_attackers_to(to, occ) & occ;
+
+        side = ~side;
+    }
+
+    // Propagate backwards: at each ply, the capturing side chooses the best
+    // option between capturing (gain[d]) and not capturing (-gain[d-1]).
+    while (--d) {
+        gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+    }
+
+    return gain[0];
 }
 
 // =============================================================================
@@ -325,20 +477,28 @@ int Search::move_score(const Board& board, Move m,
 
 void Search::sort_moves(const Board& board, MoveList& moves,
                          int start, Move tt_move, int ply) const {
+    // Score all moves once into a parallel array, then selection-sort
+    // using the precomputed scores. Previously move_score() was called
+    // per comparison (O(n^2) calls); now it is called once per move (O(n)).
+    int scores[MAX_MOVES];
+    for (int i = start; i < moves.count; i++)
+        scores[i] = move_score(board, moves.moves[i], tt_move, ply);
+
     // Selection sort: find the highest-scored move and swap it to position i.
-    // O(n^2) but fast enough for move lists of ~30-50 moves per node.
+    // O(n^2) comparisons but only O(n) score computations. Fast enough for
+    // move lists of ~30-50 moves per node.
     for (int i = start; i < moves.count; i++) {
         int best_idx   = i;
-        int best_score = move_score(board, moves.moves[i], tt_move, ply);
+        int best_score = scores[i];
 
         for (int j = i + 1; j < moves.count; j++) {
-            int s = move_score(board, moves.moves[j], tt_move, ply);
-            if (s > best_score) {
-                best_score = s;
+            if (scores[j] > best_score) {
+                best_score = scores[j];
                 best_idx   = j;
             }
         }
         std::swap(moves.moves[i], moves.moves[best_idx]);
+        std::swap(scores[i], scores[best_idx]);
     }
 }
 
@@ -398,9 +558,31 @@ Score Search::quiescence(Board& board, Score alpha, Score beta, int ply) {
 
     for (int i = 0; i < captures.count; i++) {
         Move m = captures.moves[i];
-        if (!board.is_legal(m)) continue;
+
+        // SEE pruning: skip captures with a negative exchange value.
+        // A losing capture (e.g. QxP where the pawn is defended) wastes time
+        // exploring a line that will fail low. Quiet queen promotions (no
+        // victim on the target square) are exempt — they are always good.
+        // Shortcut: if the victim is worth >= the attacker, the capture is
+        // always winning or equal — skip the full SEE computation.
+        if (board.piece_at(to_sq(m)) != NO_PIECE) {
+            PieceType vic = type_of(board.piece_at(to_sq(m)));
+            PieceType att = type_of(board.piece_at(from_sq(m)));
+            if (PIECE_VALUE[vic] < PIECE_VALUE[att] && see(board, m) < 0)
+                continue;
+        }
 
         board.make_move(m);
+
+        // Legality check: does the move leave our king in check?
+        // Same make/unmake approach as negamax — avoids the ~700 byte Board
+        // copy that is_legal() would perform.
+        if (board.is_attacked(board.king_square(~board.side_to_move),
+                              board.side_to_move)) {
+            board.unmake_move(m);
+            continue;
+        }
+
         Score score = -quiescence(board, -beta, -alpha, ply + 1);
         board.unmake_move(m);
 
@@ -479,6 +661,27 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     if (ply > 0 && (board.is_repetition() || board.half_move_clock >= 100))
         return SCORE_DRAW;
 
+    // Hard depth limit to prevent stack overflow
+    if (ply >= MAX_PLY - 1)
+        return evaluate(board);
+
+    // Compute in_check once — used for check extension, NMP guard, LMR guard,
+    // and checkmate detection. Avoids calling board.in_check() multiple times.
+    bool in_check = board.in_check();
+
+    // -------------------------------------------------------------------------
+    // CHECK EXTENSION
+    // -------------------------------------------------------------------------
+    // When the side to move is in check, extend the search by one ply.
+    // Being in check is a forcing situation — the side to move has very few
+    // legal responses (often just 1-3). Dropping into quiescence while in
+    // check would miss critical evasions. The extension ensures that check
+    // sequences are resolved at full depth before evaluation.
+    // Applied BEFORE the depth==0 quiescence entry so that a node arriving
+    // at depth 0 while in check gets extended to depth 1 (full search) instead
+    // of entering qsearch where only captures are considered.
+    if (in_check) depth++;
+
     // At depth 0, drop into quiescence to resolve captures before evaluating.
     // Must be == 0, not <= 0: with LMR a node can be called with a reduced
     // depth of exactly 0, and we want to enter quiescence at that point.
@@ -488,14 +691,6 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // sites use std::max(0, reduced_depth) to prevent negative depths.
     if (depth == 0)
         return quiescence(board, alpha, beta, ply);
-
-    // Hard depth limit to prevent stack overflow
-    if (ply >= MAX_PLY - 1)
-        return evaluate(board);
-
-    // Compute in_check once — used for NMP guard below and for checkmate
-    // detection at the bottom. Avoids calling board.in_check() twice per node.
-    bool in_check = board.in_check();
 
     // -------------------------------------------------------------------------
     // MOVE GENERATION
@@ -543,9 +738,40 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                 || (tt_entry.bound == BOUND_LOWER && tt_score >= beta)
                 || (tt_entry.bound == BOUND_UPPER && tt_score <= alpha))
             {
+#ifdef FACON_DEBUG
+                stats_.tt_cutoffs++;
+#endif
                 return tt_score;
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // STATIC EVALUATION (for pruning decisions)
+    // -------------------------------------------------------------------------
+    // Computed once per node and reused by reverse futility pruning and
+    // move-level futility pruning. Only needed when not in check AND at
+    // shallow depths where pruning applies. At depth 4+ neither RFP nor
+    // move-level futility fires, so calling evaluate() would be wasted work.
+    Score static_eval = 0;
+    bool can_prune = !in_check && ply > 0
+                  && depth <= std::max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH);
+    if (can_prune) static_eval = evaluate(board);
+
+    // -------------------------------------------------------------------------
+    // REVERSE FUTILITY PRUNING (RFP) / Static Null Move Pruning
+    // -------------------------------------------------------------------------
+    // At shallow depths, if the static evaluation is so far above beta that
+    // even a significant score drop would not bring it below beta, return
+    // immediately. This is like a cheaper version of NMP that does not require
+    // a null move search — just a static eval comparison.
+    //
+    // Guards: not in check, not at root, shallow depth (1-3).
+    // Margin: 100cp per depth level (d1=100, d2=200, d3=300).
+    if (can_prune && depth <= RFP_MAX_DEPTH
+        && static_eval - RFP_MARGIN * depth >= beta)
+    {
+        return static_eval;
     }
 
     // -------------------------------------------------------------------------
@@ -581,6 +807,9 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
             & ~board.pieces[PAWN]
             & ~board.pieces[KING]))
     {
+#ifdef FACON_DEBUG
+        stats_.nmp_attempted++;
+#endif
         board.make_null_move();
         // do_null=false prevents the child node from making another null move.
         // The reduced depth is (depth - 1 - NMP_REDUCTION): the -1 accounts
@@ -596,8 +825,12 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         // We do not update the TT here: the null move score is not a reliable
         // bound on the true score of this position (it was searched with a
         // reduced depth and a free move for the opponent).
-        if (null_score >= beta)
+        if (null_score >= beta) {
+#ifdef FACON_DEBUG
+            stats_.nmp_cutoffs++;
+#endif
             return beta;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -612,8 +845,44 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 
     for (int i = 0; i < moves.count; i++) {
         Move m = moves.moves[i];
-        if (!board.is_legal(m)) continue;
+
+        // LMR eligibility: checked BEFORE make_move so piece_at(to_sq(m))
+        // correctly identifies captures (after make_move the captured piece
+        // is gone and the square holds the moving piece instead).
+        bool is_capture = (board.piece_at(to_sq(m)) != NO_PIECE)
+                       || (move_type(m) == EN_PASSANT);
+        bool is_killer  = (m == killers_[ply][0]) || (m == killers_[ply][1]);
+
+        board.make_move(m);
+
+        // Legality check via make/unmake: instead of copying the entire Board
+        // (~700 bytes) in is_legal(), we make the move on the real board and
+        // check if our king is left in check. If illegal, unmake and skip.
+        // After make_move, side_to_move has flipped — our king (the side that
+        // just moved) is ~side_to_move, and the attacker is side_to_move.
+        if (board.is_attacked(board.king_square(~board.side_to_move),
+                              board.side_to_move)) {
+            board.unmake_move(m);
+            continue;
+        }
+
         legal_count++;
+
+        // Move-level futility pruning: at shallow depths, if the static eval
+        // plus a margin is still below alpha, quiet moves are unlikely to raise
+        // alpha. Skip them to save search time. Only applied to non-captures,
+        // non-promotions, when not in check, and after at least one legal move
+        // has been searched (to detect checkmate/stalemate correctly).
+        if (   can_prune
+            && depth <= FUTILITY_MAX_DEPTH
+            && legal_count > 1
+            && !is_capture
+            && move_type(m) != PROMOTION
+            && static_eval + FUTILITY_MARGIN * depth <= alpha)
+        {
+            board.unmake_move(m);
+            continue;
+        }
 
         // currmove: at the root, emit which move is being explored and its
         // position in the ordered list. Standard UCI fields — GUIs display
@@ -631,12 +900,6 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
             // during long iterations.
         }
 
-        // LMR eligibility: checked BEFORE make_move so piece_at(to_sq(m))
-        // correctly identifies captures (after make_move the captured piece
-        // is gone and the square holds the moving piece instead).
-        bool is_capture = (board.piece_at(to_sq(m)) != NO_PIECE)
-                       || (move_type(m) == EN_PASSANT);
-        bool is_killer  = (m == killers_[ply][0]) || (m == killers_[ply][1]);
         bool do_lmr     = (depth >= LMR_MIN_DEPTH)
                        && (legal_count > LMR_MIN_MOVES)
                        && !in_check
@@ -644,23 +907,27 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                        && (move_type(m) != PROMOTION)
                        && !is_killer;
 
-        board.make_move(m);
-
         Score score;
         if (do_lmr) {
-            // Reduction formula: log(depth) * log(move_number) / LMR_DIVISOR.
+            // Reduction from precomputed table (initialized at startup).
             // Floored at 1 and capped so reduced_depth >= 1 — we never LMR
             // directly into quiescence (depth == 0).
-            int reduction     = int(std::log(double(depth)) * std::log(double(legal_count)) / LMR_DIVISOR);
-            reduction         = std::max(1, reduction);
+            int reduction     = std::max(1, LMR_table[depth][legal_count]);
             int reduced_depth = std::max(1, depth - 1 - reduction);
 
+#ifdef FACON_DEBUG
+            stats_.lmr_attempted++;
+#endif
             // Zero-window search at reduced depth: only need to detect fail-low.
             score = -negamax(board, -alpha - 1, -alpha, reduced_depth, ply + 1);
 
             // If the reduced search did not fail low, re-search at full depth.
-            if (score > alpha)
+            if (score > alpha) {
+#ifdef FACON_DEBUG
+                stats_.lmr_re_searched++;
+#endif
                 score = -negamax(board, -beta, -alpha, depth - 1, ply + 1);
+            }
         } else {
             score = -negamax(board, -beta, -alpha, depth - 1, ply + 1);
         }
@@ -747,10 +1014,8 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                     // Beta cutoff: update move ordering heuristics for quiet moves.
                     // Captures are already well-ordered by MVV-LVA; killers and
                     // history only apply to quiet moves (no capture, no promotion,
-                    // no en passant).
-                    if (board.piece_at(to_sq(m)) == NO_PIECE
-                        && move_type(m) != EN_PASSANT
-                        && move_type(m) != PROMOTION)
+                    // no en passant). is_capture was computed before make_move.
+                    if (!is_capture && move_type(m) != PROMOTION)
                     {
                         store_killer(m, ply);
 
@@ -824,7 +1089,7 @@ SearchResult Search::go(Board& board) {
     root_move_count_   = 0;
     prev_best_move_    = MOVE_NONE;
     stable_iters_             = 0;
-    easy_move_applied_        = false;
+    easy_cumulative_          = 1.0;
     mate_reduction_applied_   = false;
 
     // Clear killer and history tables: entries from a previous position are
@@ -846,15 +1111,31 @@ SearchResult Search::go(Board& board) {
     // aborts instantly (extreme time pressure) and both root_best_move_ and the
     // TT probe fail. Updated to a better move as soon as an iteration completes.
     Move safe_move = MOVE_NONE;
+    int legal_root_count = 0;
     {
         MoveList seed_moves;
         generate_all_moves(board, seed_moves);
         for (int i = 0; i < seed_moves.count; i++) {
             if (board.is_legal(seed_moves.moves[i])) {
-                safe_move = seed_moves.moves[i];
-                break;
+                if (safe_move == MOVE_NONE) safe_move = seed_moves.moves[i];
+                legal_root_count++;
             }
         }
+    }
+
+    // Forced move: only one legal move exists. No point searching — play it
+    // immediately without spending any time. Every millisecond saved here is
+    // banked for future moves where there IS a choice.
+    // Emit a minimal info line so GUIs and match runners (fastchess, cutechess)
+    // can extract a score — some crash or warn if bestmove arrives without any
+    // preceding info line.
+    if (legal_root_count == 1) {
+        std::cout << "info depth 0 score cp 0 nodes 0 time 0 pv "
+                  << move_to_uci(safe_move) << "\n" << std::flush;
+        result.best_move = safe_move;
+        result.score     = 0;
+        result.depth     = 0;
+        return result;
     }
 
     int max_depth = (TM.depth_limit > 0) ? TM.depth_limit : MAX_PLY;
@@ -870,15 +1151,8 @@ SearchResult Search::go(Board& board) {
         current_depth_  = depth;
         std::memset(pv_length_, 0, sizeof(pv_length_));
 
-        // Count legal moves at the root for currmove "N/total" formatting.
-        // Done once per iteration; the count is stable within an iteration.
-        root_move_count_ = 0;
-        {
-            MoveList root_moves;
-            generate_all_moves(board, root_moves);
-            for (int i = 0; i < root_moves.count; i++)
-                if (board.is_legal(root_moves.moves[i])) root_move_count_++;
-        }
+        // Legal move count at root: computed once before the loop.
+        root_move_count_ = legal_root_count;
 
         // Aspiration windows: search with a narrow window around the previous
         // iteration's score. Saves nodes when the true score is close to the
@@ -886,6 +1160,7 @@ SearchResult Search::go(Board& board) {
         // re-search. Only applied at depth >= 4 — below that scores are too
         // unstable to narrow around.
         Score score;
+        int aw_fail_highs = 0;  // Count fail-highs for TM extension
         if (depth < 4 || last_score == 0 || is_mate_score(last_score)) {
             // Full window for early depths, no prior score, or when the previous
             // score was a mate. Mate scores near +/-SCORE_MATE would make the
@@ -929,6 +1204,7 @@ SearchResult Search::go(Board& board) {
                     int old_beta = beta_asp;
                     beta_asp = std::min(score + delta, SCORE_INFINITE);
                     delta   *= 2;
+                    aw_fail_highs++;
 
                     char t_now[32];
                     { int64_t ms=TM.elapsed_ms(); int64_t s=(ms/1000)%60,m=(ms/60000)%60,h=ms/3600000,ms3=ms%1000;
@@ -1063,8 +1339,18 @@ SearchResult Search::go(Board& board) {
         std::cout << "\n" << std::flush;
         last_output_ms_    = elapsed;
         last_heartbeat_ms_ = elapsed;  // end-of-iteration info line counts as substantive output
-        // Check the soft limit after each completed iteration.
-        if (TM.soft_stop()) break;
+
+#ifdef FACON_DEBUG
+        // Diagnostic stats for this iteration. Counters are cumulative across
+        // all iterations — shows the running total, not per-iteration delta.
+        std::cout << "info string ST: depth " << depth
+                  << " lmr " << stats_.lmr_attempted
+                  << "/" << stats_.lmr_re_searched
+                  << " nmp " << stats_.nmp_attempted
+                  << "/" << stats_.nmp_cutoffs
+                  << " tt_cut " << stats_.tt_cutoffs
+                  << "\n" << std::flush;
+#endif
 
         // -------------------------------------------------------------------------
         // DYNAMIC TIME MANAGEMENT
@@ -1079,53 +1365,72 @@ SearchResult Search::go(Board& board) {
             double(EXTENSION_FULL_DEPTH) / double(EXTENSION_FULL_DEPTH));
 
         // PV instability: best move changed between iterations.
-        // Score drop: evaluation fell significantly.
-        // Before applying any extension: if an easy-move reduction was applied
-        // earlier this move, cancel it first so the extension acts on the
-        // un-discounted soft limit. Otherwise extending 1.5x on a value that
-        // is already 40% of the original gives only 0.60x of the original —
-        // the extension is nearly useless.
+        // Before applying any extension: if easy-move reductions were applied,
+        // cancel them first so the extension acts on the un-discounted soft
+        // limit. Otherwise extending on a reduced value is nearly useless.
         if (depth > 1 && last_move != prev_move && last_move != MOVE_NONE) {
-            if (easy_move_applied_) {
-                TM.cancel_easy_move(EASY_REDUCE_FACTOR);
-                easy_move_applied_ = false;
+            if (easy_cumulative_ < 1.0) {
+                TM.cancel_easy_move(easy_cumulative_);
+                easy_cumulative_ = 1.0;
+                stable_iters_ = 0;
             }
             TM.extend_time(1.0 + 0.5 * depth_scale, "PV change", depth);
         }
 
+        // Score drop: evaluation fell significantly.
         if (depth > 1 && (prev_score - last_score) >= SCORE_DROP_THRESHOLD) {
-            if (easy_move_applied_) {
-                TM.cancel_easy_move(EASY_REDUCE_FACTOR);
-                easy_move_applied_ = false;
+            if (easy_cumulative_ < 1.0) {
+                TM.cancel_easy_move(easy_cumulative_);
+                easy_cumulative_ = 1.0;
+                stable_iters_ = 0;
             }
             TM.extend_time(1.0 + 0.25 * depth_scale, "score drop", depth);
         }
 
-        // Easy move reductions: only when the position is genuinely trivial.
-        // Fires ONCE (== not >=) — one-shot, cannot compound.
-        // Conditions are deliberately strict: same PV for 7 iterations,
-        // score delta < 3cp, and depth > 12 (engine is well into its
-        // operating range before we declare a position easy).
-        if (depth > 12) {
-            if (is_mate_score(last_score) && !mate_reduction_applied_) {
-                // One-shot: fires at most once per search. Without this guard,
-                // is_mate_score() is true on every subsequent iteration, and
-                // x0.05 applied repeatedly collapses the soft limit to near zero.
+        // AW fail-high extension: if the aspiration window failed high one or
+        // more times this iteration, the position is tactically volatile — the
+        // engine found something better than expected and needs time to resolve
+        // the window correctly. The extension is proportional to the number of
+        // fail-highs: x1.10 per fail-high, capped at x1.50.
+        if (aw_fail_highs > 0) {
+            double aw_factor = 1.0 + std::min(aw_fail_highs * 0.10, 0.50) * depth_scale;
+            if (easy_cumulative_ < 1.0) {
+                TM.cancel_easy_move(easy_cumulative_);
+                easy_cumulative_ = 1.0;
+                stable_iters_ = 0;
+            }
+            TM.extend_time(aw_factor, "AW fail-high", depth);
+        }
+
+        // Easy move reductions and special cases.
+        // Depth >= 10: engine is past the opening instability. Stable iters
+        // start counting here; the first reduction fires at depth 15 (10 + 5).
+        if (depth >= 10) {
+            // Mate found by us: reduce time aggressively (one-shot).
+            // Only for winning mate (score > 0). If we're being mated
+            // (score < 0), we need MORE time to find a defense, not less.
+            if (is_mate_score(last_score) && last_score > 0
+                && !mate_reduction_applied_)
+            {
                 TM.reduce_time(0.05, "mate found");
                 mate_reduction_applied_ = true;
-            } else if (!is_mate_score(last_score) && root_move_count_ == 1) {
-                TM.reduce_time(0.10, "forced move");
             } else if (!is_mate_score(last_score)) {
+                // Progressive easy-move: track stable iterations where
+                // both move and score are unchanged (within 5cp).
                 bool move_stable  = (last_move == prev_move && last_move != MOVE_NONE);
-                bool score_stable = (std::abs(last_score - prev_score) < 3);
+                bool score_stable = (std::abs(last_score - prev_score) < 5);
                 if (move_stable && score_stable)
                     stable_iters_++;
                 else
                     stable_iters_ = 0;
-                // Fires exactly once at the threshold.
-                if (stable_iters_ == 7) {
+
+                // After 5 stable iterations, each subsequent stable iteration
+                // applies a x0.95 reduction. Progressive: the longer the
+                // position stays stable, the more time is saved.
+                // 0.95^5 = 0.77, 0.95^10 = 0.60, 0.95^15 = 0.46.
+                if (stable_iters_ >= 5) {
                     TM.reduce_time(EASY_REDUCE_FACTOR, "easy move");
-                    easy_move_applied_ = true;
+                    easy_cumulative_ *= EASY_REDUCE_FACTOR;
                 }
             }
         }

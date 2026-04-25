@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-11 11:53
+// Last modified: 2026-04-18 22:51
 // eval.cpp — Material + Piece-Square Table evaluation
 //
 // PST values are from the perspective of WHITE, stored from a1..h8
@@ -35,6 +35,13 @@
 //       promotion. Bonus scaled by rank (rank 7 = largest bonus).
 //     * Connected pawns: supported diagonally by a friendly pawn. Small bonus.
 //     Constants defined in eval.h.
+//
+// Facon 1.4 — Hoja
+//   - Positional evaluation (positional_eval): mobility for knights, bishops,
+//     rooks, queens (count of pseudo-legal squares, excluding own pieces).
+//     Rook on open/semi-open files and 7th rank. Bishop pair bonus. Knight
+//     outpost bonus for knights that cannot be attacked by enemy pawns.
+//     All terms computed via bitboard operations, constants in eval.h.
 // =============================================================================
 
 #include "eval.h"
@@ -514,6 +521,120 @@ static Score pawn_structure(const Board& board) {
 }
 
 // =============================================================================
+// POSITIONAL EVALUATION (Facon 1.4)
+// =============================================================================
+// Evaluates positional factors beyond material and PSTs: piece mobility,
+// rook placement, bishop pair, and knight outposts. Returns a score from
+// White's perspective.
+
+static Score positional_eval(const Board& board) {
+    Score white_score = 0;
+    Score black_score = 0;
+
+    Bitboard occ         = board.occupancy();
+    Bitboard white_pawns = board.piece_bb(WHITE, PAWN);
+    Bitboard black_pawns = board.piece_bb(BLACK, PAWN);
+
+    // Pawn attack spans: squares attacked by enemy pawns. Used to exclude
+    // unsafe squares from mobility and to detect knight outposts.
+    Bitboard white_pawn_attacks = pawn_attacks_bb(WHITE, white_pawns);
+    Bitboard black_pawn_attacks = pawn_attacks_bb(BLACK, black_pawns);
+
+    // --- Process each color ---
+    for (int c = WHITE; c <= BLACK; c++) {
+        Color us   = Color(c);
+        Score& our_score = (us == WHITE) ? white_score : black_score;
+
+        Bitboard our_pieces   = board.by_color[us];
+        Bitboard enemy_pawn_attacks = (us == WHITE) ? black_pawn_attacks : white_pawn_attacks;
+
+        // Squares available for mobility: not occupied by own pieces and
+        // not attacked by enemy pawns (unsafe squares are penalized implicitly
+        // by excluding them from the mobility count).
+        Bitboard mob_area = ~our_pieces & ~enemy_pawn_attacks;
+
+        // ----- KNIGHT MOBILITY + OUTPOSTS -----
+        Bitboard knights = board.piece_bb(us, KNIGHT);
+        while (knights) {
+            Square sq = pop_lsb(knights);
+            int moves = popcount(knight_attack(sq) & mob_area);
+            our_score += MOBILITY_KNIGHT * moves;
+
+            // Knight outpost: on ranks 4-6 (relative), supported by own pawn,
+            // and no enemy pawn can attack the square.
+            int rel_rank = (us == WHITE) ? rank_of(sq) : 7 - rank_of(sq);
+            if (rel_rank >= 3 && rel_rank <= 5) {
+                // Check if any enemy pawn on adjacent files can advance to attack this square.
+                // Use forward fill of adjacent files from enemy pawn perspective.
+                int f = file_of(sq);
+                Bitboard adj = adjacent_files_bb(f);
+                Bitboard enemy_pawns_adj = (us == WHITE) ? (black_pawns & adj) : (white_pawns & adj);
+
+                // Enemy pawns behind or beside this square cannot attack it.
+                // Only pawns ahead of this square (from enemy's perspective) matter.
+                Bitboard forward_mask = (us == WHITE)
+                    ? ~((1ULL << (8 * rank_of(sq))) - 1)      // ranks above sq
+                    : ((1ULL << (8 * (rank_of(sq) + 1))) - 1); // ranks below sq
+
+                if (!(enemy_pawns_adj & forward_mask)) {
+                    our_score += KNIGHT_OUTPOST;
+                }
+            }
+        }
+
+        // ----- BISHOP MOBILITY + PAIR -----
+        Bitboard bishops = board.piece_bb(us, BISHOP);
+
+        // Bishop pair: both bishops present
+        if (popcount(bishops) >= 2)
+            our_score += BISHOP_PAIR_BONUS;
+
+        while (bishops) {
+            Square sq = pop_lsb(bishops);
+            int moves = popcount(bishop_attack(sq, occ) & mob_area);
+            our_score += MOBILITY_BISHOP * moves;
+        }
+
+        // ----- ROOK MOBILITY + FILES + 7TH RANK -----
+        Bitboard rooks = board.piece_bb(us, ROOK);
+        while (rooks) {
+            Square sq = pop_lsb(rooks);
+            int moves = popcount(rook_attack(sq, occ) & mob_area);
+            our_score += MOBILITY_ROOK * moves;
+
+            // Open/semi-open file
+            Bitboard this_file = file_bb(file_of(sq));
+            Bitboard our_pawns_on_file   = (us == WHITE) ? (white_pawns & this_file)
+                                                         : (black_pawns & this_file);
+            Bitboard their_pawns_on_file = (us == WHITE) ? (black_pawns & this_file)
+                                                         : (white_pawns & this_file);
+            if (!our_pawns_on_file) {
+                if (!their_pawns_on_file)
+                    our_score += ROOK_OPEN_FILE;
+                else
+                    our_score += ROOK_SEMI_OPEN_FILE;
+            }
+
+            // Rook on 7th rank (relative)
+            int rel_rank_r = (us == WHITE) ? rank_of(sq) : 7 - rank_of(sq);
+            if (rel_rank_r == 6)  // 0-indexed rank 6 = 7th rank
+                our_score += ROOK_ON_7TH;
+        }
+
+        // ----- QUEEN MOBILITY -----
+        Bitboard queens = board.piece_bb(us, QUEEN);
+        while (queens) {
+            Square sq = pop_lsb(queens);
+            Bitboard attacks = bishop_attack(sq, occ) | rook_attack(sq, occ);
+            int moves = popcount(attacks & mob_area);
+            our_score += MOBILITY_QUEEN * moves;
+        }
+    }
+
+    return white_score - black_score;
+}
+
+// =============================================================================
 // MAIN EVALUATION FUNCTION
 // =============================================================================
 
@@ -553,6 +674,10 @@ Score evaluate(const Board& board) {
     // Pawn structure: isolated, doubled, backward, passed, connected.
     // Returned from White's perspective — added directly to score.
     score += pawn_structure(board);
+
+    // Positional evaluation: mobility, open files, rook on 7th, bishop pair,
+    // knight outposts. Returned from White's perspective.
+    score += positional_eval(board);
 
     // -------------------------------------------------------------------------
     // MOPUP EVALUATION

@@ -8,11 +8,11 @@ A UCI-compliant chess engine written in C++17.
 
 *by Carlos M. Canavessi*
 
-![Version](https://img.shields.io/badge/version-1.3%20Yunque-8B0000)
+![Version](https://img.shields.io/badge/version-1.4%20Hoja-8B0000)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 ![Protocol](https://img.shields.io/badge/protocol-UCI-green)
-![Elo](https://img.shields.io/badge/Ordo%20Elo-~1900-yellow)
+![Elo](https://img.shields.io/badge/Ordo%20Elo-~2330-yellow)
 
 ---
 
@@ -24,23 +24,25 @@ Each version carries a codename that follows the knife-making process: from roug
 
 ---
 
-## Current Version: 1.3 "Yunque"
+## Current Version: 1.4 "Hoja"
 
-> *The anvil. Where the blade takes shape.*
+> *The blade. Shaped on the anvil, now with an edge.*
 
-The fourth release, focused on search selectivity, pawn structure evaluation, and time management intelligence. Measured at **+200 Elo** over version 1.2 (Ordo ~1900, gauntlet 1040 games at 2min+1sec).
+The fifth release, focused on search pruning, positional evaluation, and speed optimization. Measured at **+430 Elo** over version 1.3 (Ordo ~2330, gauntlet 1040 games at 2min+1sec). NPS improvement: +53% (Linux), +92% (Windows) over 1.3.
 
-### What's new in 1.3
+### What's new in 1.4
 
-- **Late Move Reductions (LMR)** — quiet moves searched after the first few are searched at reduced depth. If they surprise by raising alpha, they are re-searched at full depth. Formula: `log(depth) * log(move) / 2.25`.
-- **History heuristic** — quiet moves that cause beta cutoffs accumulate a score (`depth^2`), improving ordering over time and making LMR more effective.
-- **Aspiration windows** — iterative deepening searches with a narrow window around the previous score. On failure, widens only in the failing direction.
-- **Pawn structure evaluation** — five terms via bitboard operations: isolated (-15cp), doubled (-15cp), backward (-12cp), passed (rank-scaled bonus up to +80cp), connected (+8cp).
-- **Smart time management** — quadratic depth scaling for extensions (low-depth PV changes have near-zero effect), easy move reduction (mate found, forced move, stable PV for 7+ iterations), and an emergency hard limit raise for genuinely complex positions at depth 25+.
-- **Mopup insufficient material guard** — K+B vs K and K+N vs K correctly recognized as drawn instead of activating corner-chasing.
-- **Centralized versioning** — `PROJECT_VERSION` and `FACON_CODENAME` in CMakeLists.txt control all version strings via `configure_file`.
-- **`perft` command** — movegen validation with bulk-counting optimization. `perft divide` for per-move breakdown.
-- **Bug fixes** — aspiration window fail-low squeezing beta (yo-yo effect), mate reduction firing repeatedly (soft limit collapse), race condition in `ucinewgame`, castling SAN missing check/mate markers.
+- **Static Exchange Evaluation (SEE)** — simulates full capture sequences with x-ray discovery. Losing captures pruned in quiescence search.
+- **Check extension** — extends search depth by 1 when in check. Ensures critical evasions are resolved at full depth.
+- **Futility pruning** — at shallow depths, skip quiet moves when static evaluation plus a margin is below alpha. Also reverse futility pruning at the node level.
+- **Piece mobility** — knights, bishops, rooks, and queens score bonuses per pseudo-legal square available. Mobility area excludes own pieces and enemy pawn attacks.
+- **Positional bonuses** — open/semi-open file rook bonuses, rook on 7th rank, bishop pair, knight outposts.
+- **Make/unmake legality** — the ~700 byte board copy in `is_legal()` replaced with make/check/unmake in the search hot path. NPS: +130%.
+- **Depth-preferred TT replacement** — shallow entries no longer evict deeper entries for different positions.
+- **Progressive easy-move** — cumulative x0.95 reduction per stable iteration, cancellable on PV change or score drop.
+- **AW fail-high time extension** — proportional to the number of aspiration window fail-highs, up to x1.50.
+- **Forced move instant-play** — only one legal move = play immediately with zero search time.
+- **`bench` command** — 10 hand-crafted positions for NPS measurement and regression testing.
 
 ---
 
@@ -48,12 +50,13 @@ The fourth release, focused on search selectivity, pawn structure evaluation, an
 
 | Version | Codename   | Ordo Elo | Gain |
 |---------|------------|----------|------|
+| 1.4     | Hoja       | ~2330    | +430 vs 1.3 |
 | 1.3     | Yunque     | ~1900    | +200 vs 1.2 |
 | 1.2     | Rojo Vivo  | ~1700    | +340 vs 1.1 |
 | 1.1     | Herrumbre  | ~1360    | +140 vs 1.0 |
-| 1.0     | Óxido      | ~1220    | baseline |
+| 1.0     | Oxido      | ~1220    | baseline |
 
-Gauntlet methodology: 26 opponents, 40 games each (1040 total), 2min+1sec, balanced opening book. Ordo rating computed across all versions in a combined rating list.
+Gauntlet methodology: 26 opponents, 40 games each (1040 total), 2min+1sec, balanced opening book. Ordo rating computed across all versions in a combined rating list. Gauntlet field renewed at 1.4 (avg ~2310, range 2108-2504).
 
 ---
 
@@ -86,7 +89,7 @@ cmake .. \
 make -j$(nproc)
 ```
 
-The resulting binary (`facon-1.3` / `facon-1.3.exe`) is statically linked and has no external dependencies.
+The resulting binary (`facon-1.4` / `facon-1.4.exe`) is statically linked and has no external dependencies.
 
 ---
 
@@ -96,9 +99,9 @@ Facón communicates via the UCI protocol. Any UCI-compatible GUI works: [Arena](
 
 ### Quick start
 ```
-$ ./facon-1.3
+$ ./facon-1.4
 uci
-id name Facon 1.3 - Yunque
+id name Facon 1.4 - Hoja
 id author Carlos M. Canavessi
 option name Hash type spin default 16 min 1 max 1024
 uciok
@@ -106,9 +109,9 @@ isready
 readyok
 position startpos
 go movetime 2000
-info depth 1 seldepth 1 score cp 30 nodes 20 nps 0 time 0 hashfull 0 pv b1c3
+info depth 1 seldepth 1 score cp 68 nodes 41 nps 0 time 0 hashfull 0 pv e2e4
 ...
-bestmove b1c3
+bestmove e2e4
 ```
 
 ### Supported UCI options
@@ -124,15 +127,15 @@ bestmove b1c3
 ```
 facon/
 ├── src/
-│   ├── types.h         — Core types: Square, Piece, Move, Bitboard
+│   ├── types.h         — Core types: Square, Piece, Move, Bitboard, move_to_uci()
 │   ├── bitboard.h/.cpp — Magic bitboards, attack tables
-│   ├── board.h/.cpp    — Board state, make/unmake, Zobrist hashing
-│   ├── movegen.h/.cpp  — Pseudo-legal move generation
-│   ├── eval.h/.cpp     — Material + PST + king safety + mopup + pawn structure
-│   ├── tt.h/.cpp       — Transposition table
+│   ├── board.h/.cpp    — Board state, make/unmake, Zobrist hashing, all_attackers_to()
+│   ├── movegen.h/.cpp  — Pseudo-legal move generation (captures include quiet queen promotions)
+│   ├── eval.h/.cpp     — Material + PST + king safety + mopup + pawn structure + positional
+│   ├── tt.h/.cpp       — Transposition table (depth-preferred replacement)
 │   ├── timeman.h/.cpp  — Time management
-│   ├── search.h/.cpp   — Negamax alpha-beta, LMR, NMP, aspiration windows, ID
-│   ├── uci.h/.cpp      — UCI protocol handler
+│   ├── search.h/.cpp   — Negamax, LMR, NMP, SEE, futility pruning, aspiration windows, ID
+│   ├── uci.h/.cpp      — UCI protocol handler, bench command
 │   ├── main.cpp        — Entry point
 │   ├── version.h.in    — Version header template (CMake-generated)
 │   └── version.rc.in   — Windows version resource template
@@ -142,7 +145,8 @@ facon/
 │   ├── v1.0.md         — Technical documentation for v1.0
 │   ├── v1.1.md         — Technical documentation for v1.1
 │   ├── v1.2.md         — Technical documentation for v1.2
-│   └── v1.3.md         — Technical documentation for v1.3
+│   ├── v1.3.md         — Technical documentation for v1.3
+│   └── v1.4.md         — Technical documentation for v1.4
 ├── CMakeLists.txt
 ├── CHANGELOG.md
 └── README.md
@@ -152,10 +156,11 @@ facon/
 
 ## Planned improvements
 
-- **Search**: check extensions, singular extensions, SEE pruning, LMR table precalculation
-- **Evaluation**: mobility, open files, rook on 7th, bishop pair, Texel tuning
-- **Time management**: `movestogo` support, further easy-move calibration
-- **Architecture**: make/unmake approach (eliminate board copy in is_legal), incremental evaluation, Syzygy tablebases, NNUE (long-term)
+- **Search**: IID, singular extensions, countermove heuristic, razoring, LMP
+- **Evaluation**: full king attack by rays, pawn shelter/storm, piece tropism, tempo, space, endgame recognition (material signature dispatch)
+- **Transposition table**: aging (generation counter), smarter replacement
+- **Speed**: incremental evaluation (PST in make/unmake), Texel tuning of all HCE weights
+- **Architecture**: Syzygy tablebases, ponder, Lazy SMP multithreading, NNUE (long-term)
 
 ---
 

@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-12 12:30
+// Last modified: 2026-04-19 02:02
 // tt.h — Transposition Table
 //
 // A hash table that caches search results to avoid re-searching positions
@@ -29,6 +29,15 @@
 //     replacing the output that was previously in the constructor.
 //   - resize(mb, silent=false): added silent parameter so the constructor
 //     can suppress output while callers from setoption still get feedback.
+//
+// Facon 1.4 -- Hoja
+//   - TTEntry::depth changed from int8_t (max 127) to uint8_t (max 255).
+//     MAX_PLY is 128, which overflows int8_t but fits in uint8_t. The old
+//     type was a latent bug — depth 128 would store as -128, corrupting
+//     the depth comparison in probe(). Entry size unchanged (16 bytes).
+//   - Depth-preferred replacement in store(): shallow entries for different
+//     positions no longer evict deeper entries. Overwrite only if the slot
+//     is empty, same position, or new depth >= stored depth.
 // =============================================================================
 
 #pragma once
@@ -57,7 +66,7 @@ struct TTEntry {
     uint64_t  hash;   // Full Zobrist hash for collision verification  (8 bytes)
     Move      move;   // Best move found from this position            (4 bytes)
     int16_t   score;  // Search score (mate-distance adjusted)         (2 bytes)
-    int8_t    depth;  // Depth at which this entry was searched        (1 byte, max 127)
+    uint8_t   depth;  // Depth at which this entry was searched        (1 byte, max 255)
     BoundType bound;  // Type of score bound stored                    (1 byte)
 };
 

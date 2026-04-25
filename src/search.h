@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-06 00:06
+// Last modified: 2026-04-19 02:33
 // search.h — Search engine declarations
 //
 // Implements iterative deepening with negamax alpha-beta search and
@@ -53,6 +53,22 @@
 //     failing direction.
 //   - Aspiration window verbosity: fail-low and fail-high events emit
 //     "info string AW:" lines in the same style as TM messages.
+//
+// Facon 1.4 -- Hoja
+//   - total_nodes(): public getter returning stats_.nodes + stats_.qnodes
+//     after a go() call. Used by the bench command to report per-position
+//     node counts without exposing the full SearchStats struct.
+//   - LMR reduction table: precomputed int LMR_table[MAX_PLY][MAX_MOVES]
+//     replaces the per-move std::log(depth) * std::log(move) / LMR_DIVISOR
+//     calculation in the negamax hot path. Initialized once at startup via
+//     init_lmr_table(). Same formula, same results — pure speedup.
+//   - FACON_DEBUG diagnostic counters: LMR attempted/re-searched, NMP
+//     attempted/cutoffs, TT cutoffs. Compiled only with -DFACON_DEBUG.
+//     Reported via "info string ST:" after each completed iteration.
+//     Zero cost in release builds.
+//   - Futility pruning constants: RFP_MAX_DEPTH, RFP_MARGIN, FUTILITY_MAX_DEPTH,
+//     FUTILITY_MARGIN. Used by reverse futility pruning (node-level) and
+//     move-level futility pruning in negamax.
 // =============================================================================
 
 #pragma once
@@ -86,6 +102,16 @@ struct SearchStats {
     uint64_t qnodes   = 0;  // Nodes visited in quiescence()
     int      seldepth = 0;  // Maximum depth reached including quiescence
     // Note: use (nodes + qnodes) for total node count and NPS reporting.
+
+#ifdef FACON_DEBUG
+    // Diagnostic counters — compiled only with -DFACON_DEBUG (cmake -DFACON_DEBUG=ON).
+    // Zero cost in release builds. Reported via "info string ST:" after each iteration.
+    uint64_t lmr_attempted  = 0;  // Moves searched at reduced depth
+    uint64_t lmr_re_searched = 0; // LMR moves that raised alpha and were re-searched
+    uint64_t nmp_attempted  = 0;  // Null move pruning attempts
+    uint64_t nmp_cutoffs    = 0;  // NMP attempts that produced a beta cutoff
+    uint64_t tt_cutoffs     = 0;  // TT probe hits that produced a cutoff (early return)
+#endif
 };
 
 // =============================================================================
@@ -98,6 +124,10 @@ public:
     // Uses TM (TimeManager) for time control.
     // Prints UCI info lines to stdout and returns the best move found.
     SearchResult go(Board& board);
+
+    // Returns total nodes searched in the last go() call (negamax + quiescence).
+    // Used by the bench command to report per-position and total node counts.
+    uint64_t total_nodes() const { return stats_.nodes + stats_.qnodes; }
 
 private:
     SearchStats stats_;
@@ -157,9 +187,11 @@ private:
 
     // Depth at which TM extensions apply their full factor.
     // The quadratic scaling in go() gives near-zero effect at low depths
-    // and the full factor at EXTENSION_FULL_DEPTH. Calibrated from 1.2
-    // VVLTC showcase: engine reaches depth 14-22 (avg 17.0) at 12h+10min.
-    static constexpr int EXTENSION_FULL_DEPTH = 18;
+    // and the full factor at EXTENSION_FULL_DEPTH. Set to 15 so that
+    // PV changes at depth 10+ have meaningful impact. The progressive
+    // easy-move reduction counterbalances by returning time when the
+    // position is stable.
+    static constexpr int EXTENSION_FULL_DEPTH = 15;
 
     // -------------------------------------------------------------------------
     // LATE MOVE REDUCTIONS (LMR) PARAMETERS
@@ -178,12 +210,33 @@ private:
     // Larger value = less reduction per move = safer but less pruning.
     static constexpr double LMR_DIVISOR = 2.25;
 
-    // Easy move reduction factor. When a position qualifies as easy, the soft
-    // limit is multiplied by this value. Must be < 1.0.
-    // If instability is later detected (PV change / score drop), the reduction
-    // is cancelled by multiplying by 1/EASY_REDUCE_FACTOR before applying the
-    // extension, so extensions always act on the un-discounted soft limit.
-    static constexpr double EASY_REDUCE_FACTOR = 0.40;
+    // Easy move reduction factor per iteration. When a position qualifies as
+    // easy (PV and score stable for >= 5 iterations at depth >= 10), each
+    // subsequent stable iteration multiplies the soft limit by this factor.
+    // The effect is progressive: 0.95^5 = 0.77, 0.95^10 = 0.60. If the PV
+    // changes or score drops significantly, the cumulative reduction is
+    // reversed via cancel_easy_move(easy_cumulative_).
+    static constexpr double EASY_REDUCE_FACTOR = 0.95;
+
+    // -------------------------------------------------------------------------
+    // FUTILITY PRUNING PARAMETERS
+    // -------------------------------------------------------------------------
+
+    // Reverse futility pruning (RFP): at the node level, if static_eval minus
+    // a margin already exceeds beta, skip the entire node. Maximum depth for RFP.
+    static constexpr int RFP_MAX_DEPTH = 3;
+
+    // Margin per depth level for reverse futility pruning (centipawns).
+    // At depth d, prune if eval - RFP_MARGIN * d >= beta.
+    static constexpr int RFP_MARGIN = 100;
+
+    // Move-level futility pruning: skip quiet moves at shallow depths when
+    // static_eval + margin is below alpha. Maximum depth for move-level futility.
+    static constexpr int FUTILITY_MAX_DEPTH = 2;
+
+    // Margin per depth level for move-level futility pruning (centipawns).
+    // At depth d, skip quiet moves if eval + FUTILITY_MARGIN * d <= alpha.
+    static constexpr int FUTILITY_MARGIN = 150;
 
     // -------------------------------------------------------------------------
     // ASPIRATION WINDOW PARAMETERS
@@ -241,16 +294,18 @@ private:
     Move prev_best_move_ = MOVE_NONE;
 
     // Counter for consecutive completed iterations where both the PV move
-    // and score have been stable (same move, score change < 3cp).
-    // When this reaches 7 at depth > 12, go() calls TM.reduce_time(EASY_REDUCE_FACTOR).
-    // Resets to 0 whenever the PV or score changes meaningfully.
+    // and score have been stable (same move, score change < 5cp).
+    // When this reaches >= 5 at depth >= 10, go() applies progressive
+    // easy-move reductions (x0.95 per stable iteration). Resets to 0
+    // whenever the PV or score changes meaningfully.
     int stable_iters_ = 0;
 
-    // Set to true when an easy-move reduction has been applied this move.
-    // Cleared at the start of each go() call and whenever a PV change or
-    // score drop triggers cancel_easy_move() before a time extension.
-    // This ensures extensions always act on the un-discounted soft limit.
-    bool easy_move_applied_ = false;
+    // Cumulative easy-move reduction factor. Starts at 1.0 (no reduction).
+    // Each stable iteration multiplies by EASY_REDUCE_FACTOR (0.95).
+    // When a PV change or score drop triggers cancel_easy_move(), the
+    // soft limit is divided by this factor to restore the original value,
+    // then easy_cumulative_ resets to 1.0 and stable_iters_ to 0.
+    double easy_cumulative_ = 1.0;
 
     // Set to true when the "mate found" TM reduction has been applied this move.
     // Without this guard, is_mate_score(last_score) is true on every subsequent
@@ -302,3 +357,16 @@ private:
 
 // Global search instance
 extern Search Searcher;
+
+// =============================================================================
+// LMR REDUCTION TABLE
+// =============================================================================
+// Precomputed reduction values for Late Move Reductions. Indexed by
+// [depth][move_number]. Initialized once at startup by init_lmr_table().
+// Formula: max(1, int(log(depth) * log(move) / LMR_DIVISOR)).
+// Entries for depth < LMR_MIN_DEPTH or move <= LMR_MIN_MOVES are 0 (unused).
+
+extern int LMR_table[MAX_PLY][MAX_MOVES];
+
+// Must be called once at startup (from main.cpp) to fill LMR_table.
+void init_lmr_table();

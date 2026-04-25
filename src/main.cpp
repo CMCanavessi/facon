@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-27 00:00
+// Last modified: 2026-04-12 19:25
 // main.cpp — Facon Chess Engine entry point
 //
 // Initializes all subsystems and enters the UCI loop.
@@ -22,11 +22,16 @@
 //     CMakeLists.txt (PROJECT_VERSION + FACON_CODENAME). No more hardcoded
 //     version string in source files. To update the version, edit only
 //     CMakeLists.txt and rerun cmake.
+//
+// Facon 1.4 -- Hoja
+//   - init_lmr_table() call added after Zobrist::init(). Fills the
+//     precomputed LMR reduction table used by negamax().
 // =============================================================================
 
 #include "version.h"
 #include "bitboard.h"
 #include "board.h"
+#include "search.h"
 #include "tt.h"
 #include "uci.h"
 #include <iostream>
@@ -56,6 +61,10 @@ int main() {
     // Initialize Zobrist hash keys.
     // Must be called before any board is set up.
     Zobrist::init();
+
+    // Initialize the precomputed LMR reduction table.
+    // Must be called before any search is run.
+    init_lmr_table();
 
     if (interactive) {
         // Print TT size here instead of in the constructor: TT is a global

@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-06 00:06
+// Last modified: 2026-04-19 02:33
 // timeman.h — Time management
 //
 // Decides how much time to spend on the current move based on the remaining
@@ -38,6 +38,14 @@
 //     A distinct "complex position" message is emitted in this case.
 //     raw_remaining_ms_ is stored at start() to make this computation
 //     available throughout the search.
+//
+// Facon 1.4 -- Hoja
+//   - movestogo support: when the GUI sends "go ... movestogo N", the engine
+//     uses N instead of the default MOVES_TO_GO (25) for time allocation.
+//     Improves time management in tournaments with move-count time controls
+//     (e.g. 40 moves in 2 hours).
+//   - MOVES_TO_GO reduced from 30 to 25, time cap from remaining/3 to
+//     remaining*2/5 — more time per move, especially in endgames.
 // =============================================================================
 
 #pragma once
@@ -79,6 +87,11 @@ struct TimeManager {
     // Infinite search: never stop until an explicit "stop" command.
     // Used for the "go infinite" UCI command.
     bool infinite  = false;
+
+    // Moves remaining until the next time control (0 = not specified).
+    // When > 0, used instead of the default MOVES_TO_GO constant for
+    // time allocation. Set by the "go ... movestogo N" UCI parameter.
+    int movestogo  = 0;
 
     // -------------------------------------------------------------------------
     // INTERNAL STATE

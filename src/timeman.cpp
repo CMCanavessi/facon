@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-06 00:06
+// Last modified: 2026-04-19 02:33
 // timeman.cpp — Time management implementation
 //
 // Facon 1.1 — Herrumbre
@@ -30,6 +30,19 @@
 //     Both limits then rise together on subsequent extensions. A distinct
 //     "complex position" message is emitted showing both limit changes, the
 //     absolute ceiling, and remaining headroom.
+//
+// Facon 1.4 -- Hoja
+//   - movestogo support: start() uses TM.movestogo when > 0, otherwise falls
+//     back to the MOVES_TO_GO constant (25). Parsed from "go ... movestogo N"
+//     in uci.cpp. Cleared in reset().
+//   - Depth-only search fix: "go depth N" with no clock previously activated
+//     the TM fallback (600ms soft / 1000ms hard), causing time extensions and
+//     premature stops. Now treated like infinite — unlimited time, depth limit
+//     controls when to stop.
+//   - MOVES_TO_GO reduced from 30 to 25: more time per move, compensated by
+//     the increment. Realistic for games averaging 35-45 moves at this level.
+//   - Time cap relaxed from remaining/3 to remaining*2/5: slightly more
+//     permissive, allows deeper searches in endgames where the tree narrows.
 // =============================================================================
 
 #include "timeman.h"
@@ -46,7 +59,7 @@ TimeManager TM;
 // =============================================================================
 
 // Assumed number of moves remaining in the game when no movestogo is provided.
-constexpr int MOVES_TO_GO = 30;
+constexpr int MOVES_TO_GO = 25;
 
 // Fraction of the base time budget used as the soft limit.
 // Below 1.0 to leave headroom for dynamic extensions.
@@ -122,8 +135,21 @@ void TimeManager::start(Color side) {
     int increment     = (side == WHITE) ? inc_white  : inc_black;
 
     if (raw_remaining <= 0) {
-        soft_limit_ms = 600;
-        hard_limit_ms = 1000;
+        if (depth_limit > 0) {
+            // Depth-limited search with no clock: behave like infinite.
+            // Setting infinite=true suppresses all TM output (extend_time,
+            // reduce_time, start allocation report) and makes soft_stop()
+            // and should_stop() always return false. The depth limit in
+            // the search loop controls when to stop.
+            infinite      = true;
+            soft_limit_ms = 1 << 28;
+            hard_limit_ms = 1 << 28;
+        } else {
+            // No clock and no depth limit — should not happen in normal UCI,
+            // but provide a minimal safety fallback.
+            soft_limit_ms = 600;
+            hard_limit_ms = 1000;
+        }
         return;
     }
 
@@ -134,25 +160,29 @@ void TimeManager::start(Color side) {
 
     // Base formula: spread remaining time over expected moves left,
     // then add most of the increment (replenished each move).
-    int base_time = remaining / MOVES_TO_GO + increment * 3 / 4;
+    // Use movestogo from the GUI if provided, otherwise fall back to the
+    // default assumption (MOVES_TO_GO = 30).
+    int moves_left = (movestogo > 0) ? movestogo : MOVES_TO_GO;
+    int base_time  = remaining / moves_left + increment * 3 / 4;
 
     // Apply safety margin and floor.
     base_time = int(base_time * SAFETY_FACTOR);
     base_time = std::max(base_time, MIN_TIME_MS);
 
-    // Hard cap: never plan more than 1/3 of remaining time on a single move.
-    // Tighter than the old /2 cap -- prevents single-move blowout at low clock.
-    base_time = std::min(base_time, remaining / 3);
+    // Hard cap: never plan more than 2/5 of remaining time on a single move.
+    // Slightly more permissive than the old /3 cap — allows deeper searches
+    // in endgames where the tree is narrow and depth rises fast.
+    base_time = std::min(base_time, remaining * 2 / 5);
 
     // Soft limit: normal target, below base to leave room for extensions.
     soft_limit_ms = int(base_time * SOFT_FACTOR);
     soft_limit_ms = std::max(soft_limit_ms, MIN_TIME_MS);
 
     // Hard limit: absolute ceiling including extensions.
-    // Capped at 1/3 of remaining (matching base_time cap).
+    // Capped at 2/5 of remaining (matching base_time cap).
     // Hard >= soft always.
     hard_limit_ms = int(base_time * HARD_FACTOR);
-    hard_limit_ms = std::min(hard_limit_ms, remaining / 3);
+    hard_limit_ms = std::min(hard_limit_ms, remaining * 2 / 5);
     hard_limit_ms = std::max(hard_limit_ms, soft_limit_ms);
 
     char t_soft[32], t_hard[32];
@@ -361,6 +391,7 @@ void TimeManager::reset() {
     movetime          = 0;
     depth_limit       = 0;
     infinite          = false;
+    movestogo         = 0;
     soft_limit_ms     = 0;
     hard_limit_ms     = 0;
     accumulated_ext_  = 1.0;

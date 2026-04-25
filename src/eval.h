@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-05 00:01
+// Last modified: 2026-04-18 22:31
 // eval.h — Position evaluation
 //
 // Returns a score in centipawns (100 = one pawn advantage) from the
@@ -27,6 +27,11 @@
 //     and K+N vs K (theoretical draws). Without this, K+B (330cp) exceeded
 //     the MOPUP_THRESHOLD (300cp) and activated corner-chasing in drawn
 //     endings.
+//
+// Facon 1.4 — Hoja
+//   - Positional evaluation: mobility, open/semi-open files, rook on 7th,
+//     bishop pair, knight outposts. All computed in positional_eval() via
+//     bitboard operations, called once per evaluate().
 // =============================================================================
 
 #pragma once
@@ -100,6 +105,33 @@ constexpr int MOPUP_CORNER_WEIGHT = 10;
 // Reward per unit of king proximity (applied as 14 - manhattan_distance).
 // Encourages the winning king to close in on the losing king.
 constexpr int MOPUP_PROXIMITY_WEIGHT = 5;
+
+// =============================================================================
+// POSITIONAL EVALUATION CONSTANTS (Facon 1.4)
+// =============================================================================
+
+// Mobility: bonus per pseudo-legal square (excluding own pieces).
+// Higher values for pieces that benefit most from mobility.
+constexpr int MOBILITY_KNIGHT =  4;  // ~4-8 squares typical
+constexpr int MOBILITY_BISHOP =  5;  // ~5-13 squares, benefits most from diagonals
+constexpr int MOBILITY_ROOK   =  2;  // ~5-14 squares, high count even when passive
+constexpr int MOBILITY_QUEEN  =  1;  // ~9-27 squares, small bonus to avoid overvaluing
+
+// Rook on open file (no pawns of either color) and semi-open file (no friendly pawns).
+constexpr int ROOK_OPEN_FILE      = 20;
+constexpr int ROOK_SEMI_OPEN_FILE = 10;
+
+// Rook on the 7th rank (opponent's 2nd rank). Strong because it attacks pawns
+// on their starting rank and confines the enemy king to the back rank.
+constexpr int ROOK_ON_7TH = 20;
+
+// Bishop pair bonus. Two bishops complement each other's color coverage and
+// are stronger together than the sum of their parts, especially in open positions.
+constexpr int BISHOP_PAIR_BONUS = 30;
+
+// Knight outpost bonus. A knight on a square that cannot be attacked by enemy
+// pawns is a powerful anchor — it controls key squares permanently.
+constexpr int KNIGHT_OUTPOST = 20;
 
 // =============================================================================
 // EVALUATION FUNCTION

@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-03-27 00:00
+// Last modified: 2026-04-13 08:53
 // uci.h — Universal Chess Interface protocol handler
 //
 // Reads commands from stdin line by line and dispatches them to the engine.
@@ -25,6 +25,14 @@
 //     Used to verify move generator correctness before any movegen changes.
 //   - id name now uses FACON_VERSION from version.h (CMake-generated) instead
 //     of a hardcoded string.
+//
+// Facon 1.4 -- Hoja
+//   - bench command: "bench" or "bench depth N" searches a fixed set of 10
+//     positions at a given depth (default 15) and reports total nodes, time,
+//     and NPS. Used to measure the impact of optimization changes (LMR table,
+//     move scores, make/unmake) by comparing NPS before and after.
+//   - move_to_uci() deduplication: moved from static functions in search.cpp
+//     and uci.cpp to a shared inline function in types.h.
 // =============================================================================
 
 #pragma once
@@ -87,6 +95,12 @@ private:
     // "perft N" prints total nodes and elapsed time.
     // "perft divide N" also prints the node count per first legal move.
     void cmd_perft(std::istringstream& ss);
+
+    // "bench" / "bench depth N" — search a fixed set of 10 positions at
+    // depth N (default 15) and report total nodes, time, and NPS.
+    // Not part of the UCI spec. Used to measure optimization impact.
+    // Deterministic: same depth always produces the same node count.
+    void cmd_bench(std::istringstream& ss);
 
     // -------------------------------------------------------------------------
     // HELPERS

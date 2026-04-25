@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-05 00:01
+// Last modified: 2026-04-13 08:53
 // uci.cpp — UCI protocol implementation
 //
 // Facon 1.0 -- Oxido
@@ -24,6 +24,20 @@
 //     board_.set_startpos() execute. Previously TT.clear() (std::memset)
 //     could race with TT.probe()/TT.store() in the search thread, causing
 //     undefined behavior.
+//
+// Facon 1.4 -- Hoja
+//   - bench command: "bench" or "bench depth N" searches a fixed set of 10
+//     positions at a given depth (default 15) and reports per-position node
+//     counts and a total NPS figure. Positions are hardcoded and chosen to
+//     stress different engine features: LMR, NMP, quiescence, king safety,
+//     pawn structure, mopup, aspiration windows, and NMP zugzwang guards.
+//     Deterministic: same depth = same nodes. Used to measure speedup from
+//     optimization changes by comparing NPS before and after.
+//   - move_to_uci() deduplication: the static helper was identical in
+//     search.cpp and uci.cpp. Moved to types.h as an inline function.
+//     Both files now use the shared version.
+//   - movestogo UCI parameter: "go ... movestogo N" is now parsed and passed
+//     to TM.movestogo. Previously ignored with a hardcoded assumption of 30.
 // =============================================================================
 
 #include "version.h"
@@ -47,31 +61,6 @@
 
 // Global instance
 UCI Uci;
-
-// =============================================================================
-// HELPERS
-// =============================================================================
-
-// Convert a Move to its UCI string representation.
-// Examples: normal move -> "e2e4", promotion -> "e7e8q", null -> "0000"
-static std::string move_to_uci(Move m) {
-    if (m == MOVE_NONE) return "0000";
-
-    std::string s;
-    Square from = from_sq(m);
-    Square to   = to_sq(m);
-
-    s += char('a' + file_of(from));
-    s += char('1' + rank_of(from));
-    s += char('a' + file_of(to));
-    s += char('1' + rank_of(to));
-
-    if (move_type(m) == PROMOTION) {
-        const char promo[] = "nbrq";
-        s += promo[promotion_type(m) - KNIGHT];
-    }
-    return s;
-}
 
 // =============================================================================
 // MOVE PARSING
@@ -185,7 +174,7 @@ void UCI::cmd_go(std::istringstream& ss) {
         else if (token == "movetime") ss >> TM.movetime;
         else if (token == "depth")    ss >> TM.depth_limit;
         else if (token == "infinite") TM.infinite = true;
-        // "movestogo" is ignored — we always assume 30 moves remaining
+        else if (token == "movestogo") ss >> TM.movestogo;
     }
 
     // If a previous search thread is still joinable (e.g. the GUI sent "go"
@@ -357,6 +346,163 @@ void UCI::cmd_perft(std::istringstream& ss) {
 }
 
 // =============================================================================
+// COMMAND: bench (not part of UCI spec, used for performance measurement)
+// =============================================================================
+// Syntax: bench
+//         bench depth <N>
+//
+// Searches a fixed set of 10 positions at the given depth (default 15) and
+// reports per-position node counts and a total NPS figure. The positions are
+// chosen to stress different engine features: LMR, NMP, quiescence, king
+// safety, pawn structure, mopup, aspiration windows, and NMP zugzwang guards.
+//
+// Deterministic: same depth always produces the same total node count,
+// regardless of the machine. Only the elapsed time (and thus NPS) varies.
+// Run 3-5 times and average the NPS to account for OS scheduling jitter.
+//
+// The TT is cleared before each position so results are independent of
+// search order. board_ is not modified (operates on a local copy).
+
+// Bench positions: 10 hand-crafted positions covering all game phases and
+// engine features. 100% original — not copied from any other engine.
+static const char* BENCH_POSITIONS[] = {
+    // 1. Opening — Italian Game move 4. Baseline NPS, TT warm-up.
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+
+    // 2. Middlegame — Najdorf-like. ~35+ legal moves, stresses LMR + history.
+    "r2q1rk1/1bp1bppp/p1np1n2/1p2p3/4P3/1BP2N1P/PP1P1PP1/RNBQR1K1 w - - 0 12",
+
+    // 3. Middlegame — tactical. Captures in cascade, stresses quiescence.
+    "r1b1r1k1/pp1n1ppp/2p1p3/q2P4/1bPN4/4BN2/PP2QPPP/R3K2R w KQ - 0 12",
+
+    // 4. Middlegame — clear material advantage. Stresses NMP pruning.
+    "r1b2rk1/pp2qppp/2n5/3p4/3Pn3/2PB1N2/PP1Q1PPP/R1B1R1K1 w - - 0 15",
+
+    // 5. Middlegame closed — locked pawn chain. LMR + NMP guards.
+    "r1b2rk1/pp1nqppp/2n1p3/2ppP3/3P4/2PB1N2/PP1NQPPP/R1B2RK1 w - - 0 12",
+
+    // 6. King safety — exposed king on f7, coordinated attack.
+    //    Pawn on e6 blocks the Bc4-f7 diagonal so the position is legal.
+    "r1bq1r2/ppp2kpp/2n1pn2/2b1p1B1/2B1P3/3P1N2/PPP2PPP/RN1Q1RK1 w - - 0 8",
+
+    // 7. Pawn structure — passed, isolated, doubled. All eval terms active.
+    "r3r1k1/1p3pp1/p1p4p/P2pP3/1P1P4/2P2N1P/5PP1/R3R1K1 w - - 0 22",
+
+    // 8. Endgame — rook + pawns, passed pawn on d5. Deep tree.
+    "3r2k1/pp3ppp/8/3Pp3/8/4R1P1/PP3PKP/8 w - - 0 28",
+
+    // 9. Endgame — pure pawn, zugzwang-prone. NMP guards tested.
+    "8/8/1p1k4/pPp1p3/P1PpP3/3K4/8/8 w - - 0 40",
+
+    // 10. Endgame — K+R vs K. Mopup evaluation active.
+    "8/8/4k3/8/8/4K3/8/3R4 w - - 0 50",
+};
+static constexpr int BENCH_POSITION_COUNT = 10;
+static constexpr int BENCH_DEFAULT_DEPTH  = 15;
+
+// Null stream buffer: discards all output. Used by bench in quiet mode to
+// suppress UCI info lines from Searcher.go() without modifying search code.
+class NullBuffer : public std::streambuf {
+protected:
+    int overflow(int c) override { return c; }
+};
+
+void UCI::cmd_bench(std::istringstream& ss) {
+    // Parse options in any order: depth (number or "depth N") and "verbose".
+    // Examples: bench, bench 10, bench depth 10, bench verbose,
+    //           bench 10 verbose, bench verbose 10, bench depth 15 verbose
+    int  depth   = BENCH_DEFAULT_DEPTH;
+    bool verbose = false;
+
+    std::string token;
+    while (ss >> token) {
+        if (token == "verbose") {
+            verbose = true;
+        } else if (token == "depth") {
+            if (!(ss >> depth) || depth < 1) {
+                std::cout << "bench: invalid depth\n" << std::flush;
+                return;
+            }
+        } else {
+            // Try parsing as a number
+            bool valid = !token.empty();
+            for (char c : token) if (c < '0' || c > '9') { valid = false; break; }
+            if (valid) {
+                depth = 0;
+                for (char c : token) depth = depth * 10 + (c - '0');
+            } else {
+                std::cout << "bench: unknown option '" << token << "'\n" << std::flush;
+                return;
+            }
+        }
+    }
+
+    // Join any running search before we touch TM and Searcher
+    if (search_thread_.joinable()) {
+        TM.stop = true;
+        search_thread_.join();
+    }
+
+    std::cout << "\nBenchmarking: " << BENCH_POSITION_COUNT
+              << " positions, depth " << depth
+              << (verbose ? ", verbose" : "") << "\n\n" << std::flush;
+
+    // In quiet mode, redirect cout to a null buffer during the search so
+    // UCI info lines, currmove, new-best, heartbeat, and ST debug lines
+    // are all suppressed. Only our position summaries and final result
+    // are printed (we restore cout before each print).
+    NullBuffer         null_buf;
+    std::streambuf*    orig_buf = std::cout.rdbuf();
+
+    uint64_t total_nodes = 0;
+    auto bench_start = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < BENCH_POSITION_COUNT; i++) {
+        // Clear TT between positions so results are independent of order
+        TT.clear();
+
+        Board bench_board;
+        bench_board.set_fen(BENCH_POSITIONS[i]);
+
+        // Configure TM for a depth-limited search (no clock, no TM interference).
+        // infinite=true makes soft_stop() and should_stop() always return false,
+        // suppresses all TM extension/reduction messages, and prevents start()
+        // from computing time limits. The depth_limit controls when to stop.
+        TM.reset();
+        TM.depth_limit = depth;
+        TM.infinite    = true;
+
+        // Suppress search output in quiet mode
+        if (!verbose) std::cout.rdbuf(&null_buf);
+
+        auto pos_start = std::chrono::steady_clock::now();
+        Searcher.go(bench_board);
+        auto pos_end = std::chrono::steady_clock::now();
+
+        // Restore output for position summary
+        if (!verbose) std::cout.rdbuf(orig_buf);
+
+        uint64_t nodes = Searcher.total_nodes();
+        total_nodes += nodes;
+
+        int pos_ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+            pos_end - pos_start).count());
+
+        std::cout << "Position " << (i + 1) << "/" << BENCH_POSITION_COUNT
+                  << ": " << nodes << " nodes, " << pos_ms << " ms\n"
+                  << std::flush;
+    }
+
+    auto bench_end = std::chrono::steady_clock::now();
+    int total_ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+        bench_end - bench_start).count());
+    int nps = (total_ms > 0) ? int(total_nodes * 1000 / total_ms) : 0;
+
+    std::cout << "\nBench results: " << total_nodes << " nodes, "
+              << total_ms << " ms, " << nps << " nps\n" << std::flush;
+}
+
+// =============================================================================
 // MAIN UCI LOOP
 // =============================================================================
 // Reads one command per line from stdin and dispatches to the appropriate
@@ -387,6 +533,7 @@ void UCI::loop() {
         else if (token == "setoption")  cmd_setoption(ss);
         else if (token == "d")          cmd_display();
         else if (token == "perft")      cmd_perft(ss);
+        else if (token == "bench")      cmd_bench(ss);
         else if (token == "quit") {
             TM.stop = true;
             if (search_thread_.joinable())

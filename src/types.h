@@ -1,9 +1,16 @@
 // =============================================================================
+// Last modified: 2026-04-12 14:15
 // types.h — Core type definitions for the Facon chess engine
 //
 // This file defines all the fundamental types used throughout the engine:
 // squares, pieces, colors, moves, and bitboards.
-// Everything else in the engine builds on top of these types.
+//
+// Facon 1.4 -- Hoja
+//   - move_to_uci(): inline function converting a Move to its UCI string
+//     representation ("e2e4", "e7e8q", "0000"). Moved here from search.cpp
+//     and uci.cpp where it was duplicated as a static function. Lives in
+//     types.h because it depends only on types defined here (Move, Square,
+//     from_sq, to_sq, move_type, promotion_type).
 // =============================================================================
 
 #pragma once
@@ -217,4 +224,26 @@ inline std::string square_to_string(Square s) {
     r += char('a' + file_of(s));
     r += char('1' + rank_of(s));
     return r;
+}
+
+// =============================================================================
+// MOVE TO UCI STRING
+// =============================================================================
+
+// Convert a Move to its UCI string representation.
+// Examples: normal move -> "e2e4", promotion -> "e7e8q", null -> "0000"
+inline std::string move_to_uci(Move m) {
+    if (m == MOVE_NONE) return "0000";
+    Square from = from_sq(m);
+    Square to   = to_sq(m);
+    std::string s;
+    s += char('a' + file_of(from));
+    s += char('1' + rank_of(from));
+    s += char('a' + file_of(to));
+    s += char('1' + rank_of(to));
+    if (move_type(m) == PROMOTION) {
+        const char promo[] = "nbrq";
+        s += promo[promotion_type(m) - KNIGHT];
+    }
+    return s;
 }

@@ -1,11 +1,65 @@
 # Changelog
-<!-- Last modified: 2026-04-11 11:53 -->
+<!-- Last modified: 2026-04-24 14:19 -->
 
-All notable changes to Facón will be documented here.
+All notable changes to Facon will be documented here.
+
+---
+
+## [1.4] "Hoja" -- 2026-04-24
+
+**Ordo ~2330, +430 Elo over 1.3.** Gauntlet 3: 530.5/1040 (51.0%) against 26 opponents (avg ~2310). Self-play vs 1.3: +545 Elo (95.85%, 1120 games). NPS improvement: +53% (Linux), +92% (Windows) over 1.3.
+
+### Search
+
+- **Check extension** (`search.cpp`): `if (in_check) depth++` before depth==0 qsearch entry. Forces check evasions to be resolved at full depth. +30 Elo.
+- **Static Exchange Evaluation (SEE)** (`search.cpp`, `board.h`, `board.cpp`): full exchange simulation using `all_attackers_to(sq, occ)` with x-ray discovery. Captures with SEE < 0 pruned in qsearch. Shortcut: skip SEE call when victim >= attacker (always winning).
+- **Reverse futility pruning (RFP)** (`search.cpp`, `search.h`): at depth 1-3, if `eval - 100*depth >= beta`, prune the node entirely. Like NMP without the null search.
+- **Move-level futility pruning** (`search.cpp`, `search.h`): at depth 1-2, skip quiet moves if `eval + 150*depth <= alpha`. At least one move always searched.
+- **LMR table precalculated** (`search.h`, `search.cpp`, `main.cpp`): `LMR_table[MAX_PLY][MAX_MOVES]` initialized at startup replaces per-move `log(depth)*log(move)/LMR_DIVISOR` in the hot path.
+- **Move scores computed once** (`search.cpp`): parallel scores array computed O(n), selection sort uses precomputed scores. Eliminates O(n^2) `move_score()` calls. NPS: +9%.
+- **Make/unmake legality** (`search.cpp`): `is_legal()` (which copies ~700 bytes of Board per pseudo-legal move) replaced with make, king-in-check, unmake in negamax and quiescence hot paths. NPS: +130%.
+- **Quiet queen promotions in qsearch** (`movegen.cpp`, `movegen.h`): `generate_captures()` now includes queen-promotion pushes (pawn to 8th rank without capturing). A free queen was previously invisible to qsearch.
+- **Forced move instant-play** (`search.cpp`): when only one legal move exists at root, play immediately with zero search time. Emits minimal `info depth 0` line for GUI compatibility.
+
+### Evaluation
+
+- **Piece mobility** (`eval.cpp`, `eval.h`): pseudo-legal squares per piece (excluding own pieces and enemy pawn attacks). Knight 4cp, bishop 5cp, rook 2cp, queen 1cp per square.
+- **Open/semi-open files** (`eval.cpp`, `eval.h`): rook on open file (no pawns) +20cp, semi-open (no friendly pawns) +10cp.
+- **Rook on 7th rank** (`eval.cpp`, `eval.h`): +20cp for rook on the opponent's 2nd rank.
+- **Bishop pair** (`eval.cpp`, `eval.h`): +30cp when both bishops present.
+- **Knight outposts** (`eval.cpp`, `eval.h`): +20cp for knights on ranks 4-6 (relative) that cannot be attacked by enemy pawns.
+
+### Transposition Table
+
+- **Depth-preferred replacement** (`tt.cpp`, `tt.h`): `store()` refuses to overwrite a deeper entry for a different position. Overwrites only if slot is empty, same position, or new depth >= stored depth.
+- **TTEntry::depth int8_t to uint8_t** (`tt.h`, `tt.cpp`): `MAX_PLY` is 128, which overflows int8_t. Depth 128 would store as -128, corrupting probe comparisons.
+
+### Time Management
+
+- **MOVES_TO_GO 30 to 25** (`timeman.cpp`): ~20% more time per move.
+- **Progressive easy-move** (`search.cpp`, `search.h`): x0.95 per stable iteration (>=5 at depth >=10), cumulative. Cancelled on PV change or score drop >=30cp. Replaces one-shot x0.40.
+- **AW fail-high time extension** (`search.cpp`): `1.0 + 0.10 * count * depth_scale`, capped at x1.50. More fail-highs = more time to resolve the window.
+- **EXTENSION_FULL_DEPTH 18 to 15** (`search.h`): full extension factor reached earlier, balanced by progressive easy-move.
+- **Time cap relaxed** (`timeman.cpp`): `remaining/3` to `remaining*2/5`. More permissive, especially in endgames.
+- **Mate reduction guard** (`search.cpp`): `reduce_time("mate found")` only fires when `last_score > 0`. Being mated no longer triggers time reduction.
+- **soft_stop reorder** (`search.cpp`): TM extensions now always run before checking soft_stop().
+- **go depth X fix** (`timeman.cpp`): depth-limited search without clock now sets `infinite=true`. Previously activated TM fallback.
+- **movestogo UCI parameter** (`timeman.h`, `timeman.cpp`, `uci.cpp`): parsed from `go ... movestogo N`, used instead of hardcoded constant.
+
+### Infrastructure
+
+- **bench command** (`uci.cpp`, `uci.h`, `search.h`): 10 hand-crafted positions, depth 15 default. Reports per-position nodes + total NPS. Quiet by default; `bench verbose` shows full search output.
+- **all_attackers_to()** (`board.h`, `board.cpp`): returns all attackers of both colors using parameterized occupancy. Used by SEE for x-ray discovery.
+- **move_to_uci() deduplication** (`types.h`, `search.cpp`, `uci.cpp`): identical static functions moved to types.h as shared inline.
+- **FACON_DEBUG build mode** (`CMakeLists.txt`, `search.h`, `search.cpp`): `cmake -DFACON_DEBUG=ON` enables LMR/NMP/TT diagnostic counters. Zero cost in release builds.
+- **Dev codename detection** (`CMakeLists.txt`): handles dev, dev-rc1, dev-rc2, etc.
+
 
 ---
 
 ## [1.3] "Yunque" — 2026-04-11
+
+**Ordo ~1900, +200 Elo over 1.2.** Gauntlet 2: 572.0/1040 (55.0%) against 26 opponents (avg ~1870). Self-play vs 1.2: +240 Elo (1000 games).
 
 ### Pre-work bug fixes
 
@@ -52,7 +106,7 @@ All notable changes to Facón will be documented here.
 
 ---
 
-## [1.2] "Rojo Vivo" — 2026-03-14
+## [1.2] "Rojo Vivo" — 2026-03-23
 
 **+33.5% over 1.1** (870.0/1040 = 83.7% vs same 26-opponent field at 2min+1sec; Ordo **~1700**)
 
