@@ -1,9 +1,23 @@
 // =============================================================================
-// Last modified: 2026-04-12 14:15
-// types.h — Core type definitions for the Facon chess engine
+// Last modified: 2026-04-25 21:29
+// types.h -- Core type definitions for the Facon chess engine
 //
 // This file defines all the fundamental types used throughout the engine:
 // squares, pieces, colors, moves, and bitboards.
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation: Bitboard alias (uint64_t), Color enum (WHITE,
+//     BLACK, NO_COLOR) with operator~ for flipping, PieceType enum (PAWN..
+//     KING) and Piece enum (color+type packed: bit 3 = color, bits 0-2 =
+//     type), make_piece / type_of / color_of helpers. Square enum (A1..H8 +
+//     NO_SQUARE) with make_square / file_of / rank_of. Move encoding as a
+//     32-bit integer: from (6 bits), to (6 bits), MoveType (2 bits: NORMAL,
+//     PROMOTION, EN_PASSANT, CASTLING), promotion piece (2 bits) -- with
+//     make_move / make_promotion / from_sq / to_sq / move_type /
+//     promotion_type. CastlingRights mask. Score type with constants
+//     SCORE_INFINITE / SCORE_NONE / SCORE_MATE / SCORE_DRAW and
+//     is_mate_score(). MAX_MOVES (256) and MAX_PLY (128). square_to_string()
+//     for algebraic notation conversion.
 //
 // Facon 1.4 -- Hoja
 //   - move_to_uci(): inline function converting a Move to its UCI string

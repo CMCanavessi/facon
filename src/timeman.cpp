@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-19 02:33
-// timeman.cpp — Time management implementation
+// Last modified: 2026-04-25 21:29
+// timeman.cpp -- Time management implementation
 //
 // Facon 1.1 — Herrumbre
 //   Replaced the single fixed time budget with a soft/hard limit model.
@@ -161,7 +161,7 @@ void TimeManager::start(Color side) {
     // Base formula: spread remaining time over expected moves left,
     // then add most of the increment (replenished each move).
     // Use movestogo from the GUI if provided, otherwise fall back to the
-    // default assumption (MOVES_TO_GO = 30).
+    // default assumption (MOVES_TO_GO = 25).
     int moves_left = (movestogo > 0) ? movestogo : MOVES_TO_GO;
     int base_time  = remaining / moves_left + increment * 3 / 4;
 

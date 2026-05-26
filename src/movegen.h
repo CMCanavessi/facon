@@ -1,21 +1,38 @@
 // =============================================================================
-// Last modified: 2026-04-12 19:15
-// movegen.h — Move generation
+// Last modified: 2026-04-25 21:29
+// movegen.h -- Move generation
 //
 // Generates all pseudo-legal moves for a given position.
 // Pseudo-legal means the moves are valid piece movements but may leave the
-// king in check — legality is verified separately before making each move.
+// king in check -- legality is verified separately before making each move.
 //
-// Usage:
+// Usage in the search hot path (avoids the Board copy that is_legal() does):
 //   MoveList moves;
 //   generate_all_moves(board, moves);
-//   for (int i = 0; i < moves.size(); i++) {
-//       Move m = moves[i];
-//       if (!board.is_legal(m)) continue;
+//   for (int i = 0; i < moves.count; i++) {
+//       Move m = moves.moves[i];
 //       board.make_move(m);
+//       if (board.is_attacked(board.king_square(~board.side_to_move),
+//                             board.side_to_move)) {
+//           board.unmake_move(m);
+//           continue;
+//       }
 //       ...
 //       board.unmake_move(m);
 //   }
+//
+// Usage in cold paths (perft, move parsing, SAN disambiguation):
+//   board.is_legal(m) is fine -- the Board copy cost is acceptable when
+//   not in the hot loop.
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation: MoveList struct (fixed 256-move array, no heap
+//     allocation, with add() and array access), generate_all_moves() for
+//     full pseudo-legal move generation, generate_captures() for quiescence
+//     search. Per-piece generators: pawn (single push, double push, captures
+//     with edge masking, promotions, en passant), knight, bishop, rook,
+//     queen (via attack table lookups; sliders use magic bitboards), king
+//     (normal moves and castling with empty-squares + not-attacked checks).
 //
 // Facon 1.4 -- Hoja
 //   - generate_captures() now includes quiet queen promotions (pawn push

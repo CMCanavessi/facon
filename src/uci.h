@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-13 08:53
-// uci.h — Universal Chess Interface protocol handler
+// Last modified: 2026-05-14 23:15
+// uci.h -- Universal Chess Interface protocol handler
 //
 // Reads commands from stdin line by line and dispatches them to the engine.
 // Sends responses to stdout. All I/O is text-based as per the UCI spec.
@@ -33,6 +33,12 @@
 //     move scores, make/unmake) by comparing NPS before and after.
 //   - move_to_uci() deduplication: moved from static functions in search.cpp
 //     and uci.cpp to a shared inline function in types.h.
+//
+// Facon 1.5 -- Espiga
+//   - run_bench(): public entry point that wraps the private cmd_bench()
+//     handler. Used by main.cpp to support invoking the benchmark from the
+//     command line (./facon-1.5 bench). Accepts the same argument string as
+//     the UCI "bench" command ("verbose", "depth N", or both).
 // =============================================================================
 
 #pragma once
@@ -50,6 +56,12 @@ class UCI {
 public:
     // Enter the main UCI loop. Reads from stdin until "quit" is received.
     void loop();
+
+    // Run the benchmark once (with optional "verbose" and/or "depth N" flags)
+    // and return. Provided as a public entry point so the binary can be
+    // invoked as `./facon-X.Y bench [args]` without entering the UCI loop.
+    // Internally constructs an istringstream and dispatches to cmd_bench().
+    void run_bench(const std::string& args);
 
 private:
     // The current board position — updated by "position" commands
@@ -78,7 +90,8 @@ private:
     // "position fen <fen> [moves ...]"
     void cmd_position(std::istringstream& ss);
 
-    // "go [wtime X] [btime X] [winc X] [binc X] [movetime X] [depth X] [infinite]"
+    // "go [wtime X] [btime X] [winc X] [binc X] [movetime X] [depth X]
+    //     [movestogo X] [infinite]"
     void cmd_go(std::istringstream& ss);
 
     // "stop" — abort the current search immediately
@@ -90,6 +103,12 @@ private:
     // "d" — display the current board (debug command, not part of UCI spec)
     void cmd_display();
 
+    // "eval" -- print a per-component breakdown of the static evaluation of
+    // the current position (debug command, not part of UCI spec). Shows
+    // material, PST, king safety, pawn structure, positional, and mopup
+    // contributions so the user can diagnose evaluation changes.
+    void cmd_eval();
+
     // "perft N" / "perft divide N" — count leaf nodes to depth N.
     // Not part of the UCI spec. Used to verify move generator correctness.
     // "perft N" prints total nodes and elapsed time.
@@ -97,7 +116,7 @@ private:
     void cmd_perft(std::istringstream& ss);
 
     // "bench" / "bench depth N" — search a fixed set of 10 positions at
-    // depth N (default 15) and report total nodes, time, and NPS.
+    // depth N (default 18) and report total nodes, time, and NPS.
     // Not part of the UCI spec. Used to measure optimization impact.
     // Deterministic: same depth always produces the same node count.
     void cmd_bench(std::istringstream& ss);

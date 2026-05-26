@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-12 19:15
-// movegen.cpp — Pseudo-legal move generation
+// Last modified: 2026-04-25 21:29
+// movegen.cpp -- Pseudo-legal move generation
 //
 // Generates moves piece by piece in this order:
 //   1. Pawns  (most complex: pushes, double pushes, promotions, en passant)
@@ -11,17 +11,27 @@
 //   6. King (including castling)
 //
 // All generated moves are pseudo-legal: they respect piece movement rules but
-// may leave the king in check. The caller must verify legality with
-// board.is_legal() before making each move.
+// may leave the king in check. The caller must verify legality before making
+// each move (either via board.is_legal() in cold paths, or via make /
+// in_check / unmake in the search hot path -- see movegen.h for the patterns).
+//
+// Facon 1.0 -- Oxido
+//   - Initial implementation. Pawn moves: single push, double push, normal
+//     captures (with edge masking), all four promotions on push and capture
+//     to the last rank, en passant. Knight, bishop, rook, queen via attack
+//     table lookups (magic bitboards for sliders). King: normal one-step
+//     moves and castling (with empty-squares + not-currently-in-check +
+//     squares-not-attacked checks). Two entry points: generate_all_moves()
+//     for the main search and generate_captures() for quiescence.
 //
 // Facon 1.4 -- Hoja
 //   - Quiet queen promotions in generate_captures(): a pawn pushing to the
-//     8th rank without capturing gains a queen for free — as significant as
+//     8th rank without capturing gains a queen for free -- as significant as
 //     a capture. Previously invisible to quiescence search, causing the
 //     engine to miss free queens on the horizon. Only queen promotion is
 //     generated (underpromotions are nearly always inferior and would add
 //     noise to qsearch). Full move generation (generate_all_moves) is
-//     unchanged — it still generates all four promotion types.
+//     unchanged -- it still generates all four promotion types.
 // =============================================================================
 
 #include "movegen.h"

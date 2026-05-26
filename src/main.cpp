@@ -1,8 +1,9 @@
 // =============================================================================
-// Last modified: 2026-04-12 19:25
+// Last modified: 2026-05-14 23:15
 // main.cpp — Facon Chess Engine entry point
 //
-// Initializes all subsystems and enters the UCI loop.
+// Initializes all subsystems and enters the UCI loop, or runs a single
+// command from the command line (currently only "bench" is supported).
 //
 // Facon 1.0 -- Oxido
 //   - Initial implementation: initialize magic bitboard tables and Zobrist
@@ -26,6 +27,20 @@
 // Facon 1.4 -- Hoja
 //   - init_lmr_table() call added after Zobrist::init(). Fills the
 //     precomputed LMR reduction table used by negamax().
+//
+// Facon 1.5 -- Espiga
+//   - Command-line "bench" mode: invoking the binary as
+//
+//         ./facon-1.5 bench [verbose] [depth N]
+//
+//     runs the benchmark once (with the same flag handling as the UCI
+//     "bench" command), prints the result to stdout, and exits with code 0.
+//     This avoids the UCI handshake when only the benchmark output is
+//     needed (CI runs, automated NPS regression tests, profiling sweeps).
+//     The banner and TT info are still printed when stdin is a terminal,
+//     same as in interactive UCI mode. Unknown arguments produce a usage
+//     message and exit code 1. No other commands are supported on the
+//     command line at this time.
 // =============================================================================
 
 #include "version.h"
@@ -35,6 +50,7 @@
 #include "tt.h"
 #include "uci.h"
 #include <iostream>
+#include <string>
 #ifdef _WIN32
 #  include <io.h>
 #  define IS_INTERACTIVE() (_isatty(_fileno(stdin)))
@@ -43,10 +59,36 @@
 #  define IS_INTERACTIVE() (isatty(fileno(stdin)))
 #endif
 
-int main() {
-    // Only print startup messages when running interactively.
-    // When launched by a GUI or fastchess, stderr is piped and these messages
-    // would pollute the match output.
+static void print_cli_usage() {
+    std::cerr << "Usage: facon-" << FACON_VERSION << " [command [args...]]\n"
+              << "\n"
+              << "Without arguments, enters the standard UCI command loop.\n"
+              << "\n"
+              << "Commands:\n"
+              << "  bench [verbose] [depth N]\n"
+              << "      Run the benchmark and exit. Optional flags:\n"
+              << "        verbose   Emit full search output for each position.\n"
+              << "        depth N   Override the default search depth (18).\n"
+              << "      Examples:\n"
+              << "        facon-1.5 bench\n"
+              << "        facon-1.5 bench verbose\n"
+              << "        facon-1.5 bench depth 22\n"
+              << "        facon-1.5 bench verbose depth 22\n";
+}
+
+int main(int argc, char** argv) {
+    // Detect command-line invocation. Currently only "bench" is supported.
+    bool cli_bench = (argc >= 2 && std::string(argv[1]) == "bench");
+    bool cli_unknown = (argc >= 2 && !cli_bench);
+
+    if (cli_unknown) {
+        std::cerr << "Error: unknown command '" << argv[1] << "'\n\n";
+        print_cli_usage();
+        return 1;
+    }
+
+    // Banner / startup info: print whenever stdin is a terminal, regardless
+    // of whether we are entering UCI loop or running a CLI command.
     bool interactive = IS_INTERACTIVE();
 
     if (interactive) {
@@ -73,6 +115,18 @@ int main() {
         // constructor; we report the initial size here in the right order.
         TT.print_info();
         std::cerr << "\n";
+    }
+
+    if (cli_bench) {
+        // Build an argument string from argv[2..argc-1] and dispatch to the
+        // same code path as the UCI "bench" command.
+        std::string args;
+        for (int i = 2; i < argc; i++) {
+            if (i > 2) args += " ";
+            args += argv[i];
+        }
+        Uci.run_bench(args);
+        return 0;
     }
 
     // Enter the UCI command loop.

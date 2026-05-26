@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-18 22:51
-// eval.cpp — Material + Piece-Square Table evaluation
+// Last modified: 2026-05-19 13:55
+// eval.cpp -- Material + Piece-Square Table evaluation
 //
 // PST values are from the perspective of WHITE, stored from a1..h8
 // (index 0=a1, index 63=h8). For BLACK we mirror the table vertically
@@ -42,11 +42,78 @@
 //     Rook on open/semi-open files and 7th rank. Bishop pair bonus. Knight
 //     outpost bonus for knights that cannot be attacked by enemy pawns.
 //     All terms computed via bitboard operations, constants in eval.h.
+//
+// Facon 1.5 -- Espiga
+//   - evaluate_verbose(): debug helper that prints a per-component breakdown
+//     of evaluate() to stdout. Reproduces the exact logic of evaluate() but
+//     accumulates each term separately. Called from the UCI "eval" command.
+//     Not in the search hot path.
+//   - game_phase() inversion fix: the function returned the opposite of its
+//     documented contract -- 0 in startpos (should have been 256 = middlegame)
+//     and 256 in pure endgame (should have been 0). Consumers (king_safety,
+//     pst_value for the king) were written assuming the documented contract,
+//     so they silently used the wrong tables: king_safety returned 0 in the
+//     middlegame (zeroed by phase_mg=0), and pst_value used PST_KING_EG
+//     instead of PST_KING_MG from move 1 (incentivizing centralizing the king
+//     from the opening). The fix inverts the counting: phase now starts at 0
+//     and adds material present, instead of starting at TOTAL_PHASE and
+//     subtracting material absent. Consumers are unchanged. Bench signature
+//     changes (expected: evaluation values move, alpha-beta cutoffs change,
+//     node counts shift).
+//   - Knight outpost forward_mask fix: the forward_mask used to disqualify
+//     outposts incorrectly included the knight's own rank, causing
+//     false-negatives when an enemy pawn sat on the same rank in an adjacent
+//     file. Such pawns cannot attack the knight (pawns capture diagonally
+//     forward, not horizontally), so they should not disqualify the outpost.
+//     Fix: forward_mask is now STRICTLY ahead of the knight. Includes a guard
+//     against undefined behavior (1ULL << 64) for the edge case of a white
+//     knight on rank 8 (which can occur in endgames).
+//   - eval command label fix: the game_phase line in the "eval" output said
+//     "0 = endgame, 256 = middlegame", which was misleading because phase
+//     reflects non-pawn material remaining and does not distinguish opening
+//     from middlegame. Corrected to "0 = bare kings, 256 = full non-pawn
+//     material" -- factually accurate.
+//   - Mopup insufficient material guard extended: the guard for drawn
+//     endgames now covers K+N+N vs K and K+B+B vs K (when both bishops are
+//     on same-colored squares), in addition to the previously covered K+B
+//     vs K and K+N vs K. Without these additions the strong side's material
+//     exceeded MOPUP_THRESHOLD and corner-chasing activated in theoretically
+//     drawn positions, causing the engine to refuse draws and wander.
+//     K+B+B with opposite-colored bishops correctly remains a winning
+//     endgame and continues to trigger mopup.
+//   - Knight outpost refactor: the previous outpost detection was incomplete
+//     -- it required only that the square not be attackable by enemy pawns,
+//     but the documented design also called for friendly pawn support, which
+//     was never implemented. The bonus was a flat 20cp regardless of how
+//     anchored the knight was. Refactored to two tiers:
+//     KNIGHT_OUTPOST_REACHABLE (10cp, no friendly pawn support) and
+//     KNIGHT_OUTPOST_SUPPORTED (25cp, supported by a friendly pawn).
+//     Following the convention used by other HCE engines.
+//   - evaluate_verbose() label fix: the "skipped: |partial| below threshold"
+//     message was emitted in cases where mopup_eval was actually called and
+//     returned 0 due to its insufficient material guard. Added a third
+//     explanatory branch: "(skipped: insufficient material in mopup)" for
+//     the cases where partial DOES exceed the threshold but the position
+//     is a theoretical draw (KB vs K, KN vs K, KNN vs K, KBB same color vs K).
+//
+// Note on drawn pawnless endings: a "fix" was attempted that overrode the
+// final score to 0 when mopup_eval correctly identified a drawn material
+// configuration (KB vs K, KN vs K, KNN vs K, KBB same color vs K). The
+// override was logically correct (these endings are theoretically drawn)
+// but caused measurable gameplay regression in extended testing: the engine
+// became less motivated to reach positions that propagated such draws back
+// through search, even when intermediate positions along the way were
+// genuinely winning. The override was reverted. The underlying limitation
+// -- evaluate() reports the raw material count for these pawnless endings
+// rather than recognizing them as draws -- is acknowledged and deferred
+// to a future version with proper material-signature endgame recognition.
 // =============================================================================
 
 #include "eval.h"
 #include "bitboard.h"
 #include <algorithm>  // std::max
+#include <iostream>   // std::cout in evaluate_verbose
+#include <iomanip>    // std::setw in evaluate_verbose
 
 // =============================================================================
 // PIECE-SQUARE TABLES
@@ -154,12 +221,23 @@ static const int PST_KING_EG[64] = {
 static const int PHASE_VALUE[7] = { 0, 0, 1, 1, 2, 4, 0 };
 constexpr int TOTAL_PHASE = 24;  // 4 knights + 4 bishops + 4 rooks + 2 queens
 
-// Returns a value 0..256 where 256 = full middlegame, 0 = full endgame
+// Returns a value 0..256 where 256 = full middlegame, 0 = full endgame.
+// The phase counts non-pawn material remaining: full set (Q+2R+2B+2N per
+// side = 24 phase units) = middlegame; only kings = 0 = pure endgame.
+//
+// FIX (Facon 1.5): in 1.0..1.4 this function had its formula
+// inverted -- it counted *missing* material instead of remaining material,
+// returning 0 in startpos and 256 in pure endgame, the opposite of the
+// documented contract. Consumers (king_safety, pst_value for the king)
+// were written assuming the documented contract, so they were silently
+// using the wrong tables: king_safety returned 0 in middlegame (zeroed by
+// phase_mg=0), and pst_value used PST_KING_EG instead of PST_KING_MG in
+// the opening (incentivizing centralizing the king from move 1).
 static int game_phase(const Board& board) {
-    int phase = TOTAL_PHASE;
+    int phase = 0;
     for (int pt = KNIGHT; pt <= QUEEN; pt++)
-        phase -= popcount(board.piece_bb(PieceType(pt))) * PHASE_VALUE[pt];
-    phase = std::max(phase, 0);  // Clamp in case of unusual positions
+        phase += popcount(board.piece_bb(PieceType(pt))) * PHASE_VALUE[pt];
+    phase = std::min(phase, TOTAL_PHASE);  // Clamp in case of unusual positions
     return (phase * 256 + TOTAL_PHASE / 2) / TOTAL_PHASE;
 }
 
@@ -325,17 +403,53 @@ static int king_distance(Square a, Square b) {
 static Score mopup_eval(const Board& board, Color strong_side) {
     Color  weak_side    = ~strong_side;
 
-    // Insufficient material guard: K+B vs K and K+N vs K are theoretical
-    // draws — no sequence of moves can force checkmate. Without this guard,
-    // K+B (330cp) and K+N (320cp) exceed MOPUP_THRESHOLD (300cp) and activate
-    // corner-chasing in drawn endings, causing the engine to refuse draws and
-    // wander indefinitely.
+    // Insufficient material guard: certain combinations are theoretical draws
+    // -- no sequence of moves can force checkmate against optimal defense.
+    // Without this guard, the strong side's material would exceed
+    // MOPUP_THRESHOLD (300cp), corner-chasing would activate, and the engine
+    // would refuse draws to wander indefinitely chasing the opposing king.
+    //
+    // Drawn combinations covered:
+    //   K + B   vs K          (lone bishop, 330cp)
+    //   K + N   vs K          (lone knight, 320cp)
+    //   K + N+N vs K          (two knights, 640cp -- drawn against optimal play)
+    //   K + B+B vs K          ONLY when both bishops occupy same-colored squares
+    //                         (660cp -- drawn; opposite-colored bishops do mate)
     Bitboard strong_pieces = board.all_pieces(strong_side);
     int strong_count = popcount(strong_pieces);  // includes king
+
     if (strong_count == 2) {
-        // King + one piece. Check if that piece is a lone bishop or knight.
+        // King + one piece. Drawn if that piece is a lone bishop or knight.
         if (board.piece_bb(strong_side, BISHOP) || board.piece_bb(strong_side, KNIGHT))
             return 0;
+    }
+    else if (strong_count == 3) {
+        // King + two pieces. Check the two specific drawn combinations.
+        Bitboard knights = board.piece_bb(strong_side, KNIGHT);
+        Bitboard bishops = board.piece_bb(strong_side, BISHOP);
+        Bitboard rooks   = board.piece_bb(strong_side, ROOK);
+        Bitboard queens  = board.piece_bb(strong_side, QUEEN);
+
+        // K + N + N: drawn (two knights cannot force mate against a lone king).
+        if (popcount(knights) == 2 && bishops == 0 && rooks == 0 && queens == 0)
+            return 0;
+
+        // K + B + B: drawn ONLY if both bishops are on same-colored squares.
+        // Two same-color bishops can only attack squares of one color and
+        // cannot force the lone king into a mating net. Opposite-colored
+        // bishops DO mate (a known elementary endgame), so we must distinguish.
+        if (popcount(bishops) == 2 && knights == 0 && rooks == 0 && queens == 0) {
+            // Get both bishop squares and check if they share square color.
+            // Square color parity: (file + rank) & 1 -- 0 = one color, 1 = the other.
+            Bitboard b_copy = bishops;
+            Square s1 = pop_lsb(b_copy);
+            Square s2 = pop_lsb(b_copy);
+            int parity1 = (file_of(s1) + rank_of(s1)) & 1;
+            int parity2 = (file_of(s2) + rank_of(s2)) & 1;
+            if (parity1 == parity2)
+                return 0;  // Same color -- drawn
+            // Opposite colors -- fall through to normal mopup (this IS a win).
+        }
     }
 
     Square strong_king  = board.king_square(strong_side);
@@ -560,24 +674,63 @@ static Score positional_eval(const Board& board) {
             int moves = popcount(knight_attack(sq) & mob_area);
             our_score += MOBILITY_KNIGHT * moves;
 
-            // Knight outpost: on ranks 4-6 (relative), supported by own pawn,
-            // and no enemy pawn can attack the square.
+            // Knight outpost: on relative ranks 4-6 (advanced enemy territory),
+            // not attackable by any enemy pawn now or in the future, with a
+            // graduated bonus depending on whether a friendly pawn supports
+            // (defends) the square.
             int rel_rank = (us == WHITE) ? rank_of(sq) : 7 - rank_of(sq);
             if (rel_rank >= 3 && rel_rank <= 5) {
                 // Check if any enemy pawn on adjacent files can advance to attack this square.
-                // Use forward fill of adjacent files from enemy pawn perspective.
                 int f = file_of(sq);
                 Bitboard adj = adjacent_files_bb(f);
                 Bitboard enemy_pawns_adj = (us == WHITE) ? (black_pawns & adj) : (white_pawns & adj);
 
-                // Enemy pawns behind or beside this square cannot attack it.
-                // Only pawns ahead of this square (from enemy's perspective) matter.
-                Bitboard forward_mask = (us == WHITE)
-                    ? ~((1ULL << (8 * rank_of(sq))) - 1)      // ranks above sq
-                    : ((1ULL << (8 * (rank_of(sq) + 1))) - 1); // ranks below sq
+                // Enemy pawns behind, beside, or on the same rank as this square
+                // cannot attack it. Only pawns STRICTLY AHEAD (from enemy's
+                // perspective) matter, since pawns capture diagonally forward.
+                //
+                // White knight: only ranks STRICTLY > rank_of(sq) count.
+                //   Edge case: if the knight is on rank 8 (rank_of=7), the
+                //   shift would be 1ULL << 64 which is undefined behavior.
+                //   Guard with explicit zero in that case (no enemy pawns
+                //   above rank 8 exist anyway). Knights occasionally end up
+                //   on rank 8 in endgames so the guard is real, not theoretical.
+                // Black knight: only ranks STRICTLY < rank_of(sq) count.
+                //   Edge case: rank 1 (rank_of=0) yields shift 0 which gives
+                //   mask=0 (no enemy pawns can attack rank 1 anyway, since
+                //   white pawns attack toward higher ranks). No guard needed.
+                Bitboard forward_mask;
+                if (us == WHITE) {
+                    int r = rank_of(sq);
+                    forward_mask = (r >= 7) ? 0ULL
+                                            : ~((1ULL << (8 * (r + 1))) - 1);
+                } else {
+                    forward_mask = ((1ULL << (8 * rank_of(sq))) - 1);
+                }
 
                 if (!(enemy_pawns_adj & forward_mask)) {
-                    our_score += KNIGHT_OUTPOST;
+                    // Square is safe from pawn attack. Now check if a friendly
+                    // pawn supports the square (defends it from capture by an
+                    // enemy minor piece).
+                    //
+                    // Trick: the squares from which a friendly pawn would
+                    // defend `sq` are exactly the squares that an enemy pawn
+                    // would attack from `sq`. We use pawn_attack(~us, sq) to
+                    // get those squares, then AND with our pawns.
+                    //
+                    // Example: white knight on e5. Friendly pawns defending
+                    // e5 sit on d4 and f4. Equivalently, a black pawn on e5
+                    // would attack d4 and f4. So pawn_attack(BLACK, e5)
+                    // returns the mask {d4, f4}, and (white_pawns & mask)
+                    // tells us if any friendly pawn supports the knight.
+                    Bitboard our_pawns    = (us == WHITE) ? white_pawns : black_pawns;
+                    Bitboard support_mask = pawn_attack(~us, sq);
+
+                    if (our_pawns & support_mask) {
+                        our_score += KNIGHT_OUTPOST_SUPPORTED;
+                    } else {
+                        our_score += KNIGHT_OUTPOST_REACHABLE;
+                    }
                 }
             }
         }
@@ -693,4 +846,132 @@ Score evaluate(const Board& board) {
     }
 
     return (board.side_to_move == WHITE) ? score : -score;
+}
+
+// =============================================================================
+// VERBOSE EVALUATION (debug command)
+// =============================================================================
+// Prints a per-component breakdown of evaluate() to stdout. Reproduces the
+// exact logic of evaluate() but accumulates each component separately so the
+// caller can see which terms contribute to the final score. Output format
+// uses cp units (centipawns) and is from White's perspective until the final
+// "Total (side to move)" line, which is flipped if Black is to move.
+//
+// Used by the UCI "eval" command for debugging evaluation changes. Not in
+// the search hot path -- runs once per command invocation.
+
+void evaluate_verbose(const Board& board) {
+    int   phase_mg = game_phase(board);
+
+    Score material_w  = 0, material_b  = 0;
+    Score pst_w       = 0, pst_b       = 0;
+
+    // Material + PST per piece type, accumulated separately
+    for (int pt = PAWN; pt <= KING; pt++) {
+        PieceType piece_type = PieceType(pt);
+
+        Bitboard wb = board.piece_bb(WHITE, piece_type);
+        while (wb) {
+            Square sq    = pop_lsb(wb);
+            material_w  += PIECE_VALUE[pt];
+            pst_w       += pst_value(piece_type, WHITE, sq, phase_mg);
+        }
+
+        Bitboard bb = board.piece_bb(BLACK, piece_type);
+        while (bb) {
+            Square sq    = pop_lsb(bb);
+            material_b  += PIECE_VALUE[pt];
+            pst_b       += pst_value(piece_type, BLACK, sq, phase_mg);
+        }
+    }
+
+    Score king_safety_w = king_safety(board, WHITE, phase_mg);
+    Score king_safety_b = king_safety(board, BLACK, phase_mg);
+
+    Score pawn_struct  = pawn_structure(board);
+    Score positional   = positional_eval(board);
+
+    // Compute partial total (everything except mopup) to decide if mopup applies
+    Score partial = (material_w - material_b) + (pst_w - pst_b)
+                  + (king_safety_w - king_safety_b)
+                  + pawn_struct + positional;
+
+    Score mopup = 0;
+    bool no_pawns = board.piece_bb(PAWN) == 0;
+    if (no_pawns && std::abs(partial) >= MOPUP_THRESHOLD) {
+        Color strong_side = (partial > 0) ? WHITE : BLACK;
+        mopup = mopup_eval(board, strong_side);
+    }
+
+    Score total_white_pov = partial + mopup;
+    Score total_stm = (board.side_to_move == WHITE) ? total_white_pov : -total_white_pov;
+
+    // Determine why mopup was skipped (if it was), so we can show an accurate
+    // label. There are three reasons mopup can be 0:
+    //   1. Pawns are present on the board (mopup only applies to pawnless endings).
+    //   2. The partial score does not exceed MOPUP_THRESHOLD (no material edge).
+    //   3. mopup_eval was called but returned 0 due to its insufficient-material
+    //      guard (e.g. KB vs K, KN vs K, KNN vs K, KBB same-color vs K).
+    // Cases 1 and 2 are detected directly. Case 3 we detect by replicating the
+    // guard logic from mopup_eval here (small duplication, but keeps the hot
+    // path untouched).
+    bool mopup_drawn_material = false;
+    if (mopup == 0 && no_pawns && std::abs(partial) >= MOPUP_THRESHOLD) {
+        Color strong_side = (partial > 0) ? WHITE : BLACK;
+        Bitboard strong_pieces = board.all_pieces(strong_side);
+        int strong_count = popcount(strong_pieces);
+        if (strong_count == 2) {
+            if (board.piece_bb(strong_side, BISHOP) || board.piece_bb(strong_side, KNIGHT))
+                mopup_drawn_material = true;
+        }
+        else if (strong_count == 3) {
+            Bitboard knights = board.piece_bb(strong_side, KNIGHT);
+            Bitboard bishops = board.piece_bb(strong_side, BISHOP);
+            Bitboard rooks   = board.piece_bb(strong_side, ROOK);
+            Bitboard queens  = board.piece_bb(strong_side, QUEEN);
+            if (popcount(knights) == 2 && bishops == 0 && rooks == 0 && queens == 0)
+                mopup_drawn_material = true;
+            else if (popcount(bishops) == 2 && knights == 0 && rooks == 0 && queens == 0) {
+                Bitboard b_copy = bishops;
+                Square s1 = pop_lsb(b_copy);
+                Square s2 = pop_lsb(b_copy);
+                int parity1 = (file_of(s1) + rank_of(s1)) & 1;
+                int parity2 = (file_of(s2) + rank_of(s2)) & 1;
+                if (parity1 == parity2) mopup_drawn_material = true;
+            }
+        }
+    }
+
+    std::cout << "Static evaluation (cp = centipawns, +ve favors White unless noted):\n";
+    std::cout << "  game phase (0 = bare kings, 256 = full non-pawn material): " << phase_mg << "\n";
+    std::cout << "\n";
+    std::cout << "                         White       Black       Diff (W - B)\n";
+    std::cout << "  Material:           "
+              << std::setw(6) << material_w << "      "
+              << std::setw(6) << material_b << "      "
+              << std::setw(6) << (material_w - material_b) << "\n";
+    std::cout << "  PST:                "
+              << std::setw(6) << pst_w << "      "
+              << std::setw(6) << pst_b << "      "
+              << std::setw(6) << (pst_w - pst_b) << "\n";
+    std::cout << "  King safety:        "
+              << std::setw(6) << king_safety_w << "      "
+              << std::setw(6) << king_safety_b << "      "
+              << std::setw(6) << (king_safety_w - king_safety_b) << "\n";
+    std::cout << "\n";
+    std::cout << "  Pawn structure (W-B perspective):  " << std::setw(6) << pawn_struct << "\n";
+    std::cout << "  Positional     (W-B perspective):  " << std::setw(6) << positional << "\n";
+    std::cout << "  Mopup          (W-B perspective):  " << std::setw(6) << mopup;
+    if (mopup == 0) {
+        if      (!no_pawns)            std::cout << "  (skipped: pawns present)";
+        else if (mopup_drawn_material) std::cout << "  (skipped: insufficient material in mopup)";
+        else                           std::cout << "  (skipped: |partial| below threshold)";
+    }
+    std::cout << "\n";
+    std::cout << "\n";
+    std::cout << "  Total (White's perspective):       " << std::setw(6) << total_white_pov << "\n";
+    std::cout << "  Total (side to move = "
+              << (board.side_to_move == WHITE ? "White" : "Black") << "):       "
+              << std::setw(6) << total_stm << "\n";
+    std::cout << std::flush;
 }

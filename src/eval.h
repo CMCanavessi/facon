@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-18 22:31
-// eval.h — Position evaluation
+// Last modified: 2026-05-01 02:20
+// eval.h -- Position evaluation
 //
 // Returns a score in centipawns (100 = one pawn advantage) from the
 // perspective of the side to move. Positive = good for the mover.
@@ -32,6 +32,18 @@
 //   - Positional evaluation: mobility, open/semi-open files, rook on 7th,
 //     bishop pair, knight outposts. All computed in positional_eval() via
 //     bitboard operations, called once per evaluate().
+//
+// Facon 1.5 -- Espiga
+//   - evaluate_verbose(): debug helper that prints a per-component breakdown
+//     of evaluate() to stdout. Used by the UCI "eval" command. Not in the
+//     search hot path -- runs once per command invocation.
+//   - Knight outpost refactor: replaced the single KNIGHT_OUTPOST constant
+//     (flat 20cp) with two graduated bonuses:
+//       KNIGHT_OUTPOST_REACHABLE (10cp): square is safe from pawn attack
+//         but not defended by a friendly pawn.
+//       KNIGHT_OUTPOST_SUPPORTED (25cp): square is safe AND supported by
+//         a friendly pawn (firmly anchored).
+//     The previous flat bonus did not distinguish the two cases.
 // =============================================================================
 
 #pragma once
@@ -129,9 +141,15 @@ constexpr int ROOK_ON_7TH = 20;
 // are stronger together than the sum of their parts, especially in open positions.
 constexpr int BISHOP_PAIR_BONUS = 30;
 
-// Knight outpost bonus. A knight on a square that cannot be attacked by enemy
-// pawns is a powerful anchor — it controls key squares permanently.
-constexpr int KNIGHT_OUTPOST = 20;
+// Knight outpost bonuses. An outpost is a square in advanced enemy territory
+// (relative ranks 4-6) that cannot be attacked by enemy pawns. Two tiers:
+//   - REACHABLE: square is safe from pawn attack but not defended by a
+//     friendly pawn. The knight is well-placed but can be challenged by an
+//     enemy minor piece for an even trade.
+//   - SUPPORTED: square is safe AND defended by a friendly pawn. The knight
+//     is firmly anchored; an enemy minor piece challenge loses material.
+constexpr int KNIGHT_OUTPOST_REACHABLE = 10;
+constexpr int KNIGHT_OUTPOST_SUPPORTED = 25;
 
 // =============================================================================
 // EVALUATION FUNCTION
@@ -140,3 +158,9 @@ constexpr int KNIGHT_OUTPOST = 20;
 // Evaluate the position and return a score from the perspective of
 // board.side_to_move. Positive = good for the side to move.
 Score evaluate(const Board& board);
+
+// Print a per-component breakdown of evaluate() to stdout. Used by the UCI
+// "eval" debug command. Reproduces the exact logic of evaluate() but
+// accumulates each term separately so the user can see which factors
+// contribute to the final score.
+void evaluate_verbose(const Board& board);

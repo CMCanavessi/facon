@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-13 08:53
-// uci.cpp — UCI protocol implementation
+// Last modified: 2026-05-14 23:15
+// uci.cpp -- UCI protocol implementation
 //
 // Facon 1.0 -- Oxido
 //   - Initial implementation: command dispatch loop, position parsing,
@@ -38,6 +38,30 @@
 //     Both files now use the shared version.
 //   - movestogo UCI parameter: "go ... movestogo N" is now parsed and passed
 //     to TM.movestogo. Previously ignored with a hardcoded assumption of 30.
+//
+// Facon 1.5 -- Espiga
+//   - cmd_setoption() Hash parse safety: replaced std::stoi() with the
+//     same manual digit-parse pattern used by cmd_perft(). Release builds
+//     are compiled with -fno-exceptions, so std::stoi on a non-numeric value
+//     would call std::terminate() and crash the engine. Defensive against
+//     malformed setoption commands (e.g. "setoption name Hash value abc").
+//   - bench rebalancing: replaced 6 of 10 positions (1, 3, 7, 8, 9, 10) and
+//     kept the other 4 (2, 4, 5, 6). Default depth raised from 15 to 18
+//     for more meaningful measurements (1.4 set was 0.01% to 38.85% per
+//     position at depth 18; new set is 2.7% to 16.7% -- much better
+//     balanced). New BenchPosition struct couples each FEN with a label
+//     describing the primary feature exercised. Verbose output now prints
+//     position number, label, FEN, and the nodes/ms summary.
+//   - cmd_eval(): new debug command "eval" that prints a per-component
+//     breakdown of the static evaluation of the current position. Calls
+//     evaluate_verbose() in eval.cpp. Used to diagnose evaluation changes
+//     by comparing output before and after a code change. Not part of the
+//     UCI spec; not in the search hot path.
+//   - run_bench(): public wrapper around cmd_bench() so main.cpp can
+//     dispatch the benchmark from the command line (./facon-1.5 bench
+//     [verbose] [depth N]) without entering the UCI loop. Pure wrapper:
+//     constructs an istringstream from the argument string and calls
+//     cmd_bench() directly. No change to bench behaviour or output.
 // =============================================================================
 
 #include "version.h"
@@ -46,6 +70,7 @@
 #include "tt.h"
 #include "timeman.h"
 #include "movegen.h"
+#include "eval.h"
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -184,9 +209,10 @@ void UCI::cmd_go(std::istringstream& ss) {
 
     // Launch the search in a dedicated thread so the UCI loop can keep
     // reading stdin. The thread prints "bestmove" when the search finishes.
-    // We capture board_ by value so the search works on a stable copy —
-    // the UCI loop must not modify board_ while the search is running
-    // (the GUI is required by the UCI spec to send "stop" before "position").
+    // We capture board_ by value so the search works on a stable copy --
+    // the UCI loop must not modify board_ while the search is running.
+    // GUIs are expected to send "stop" before changing position, but this
+    // is convention rather than a strict UCI spec requirement.
     Board search_board = board_;
     search_thread_ = std::thread([search_board]() mutable {
         SearchResult result = Searcher.go(search_board);
@@ -228,7 +254,18 @@ void UCI::cmd_setoption(std::istringstream& ss) {
         value += (value.empty() ? "" : " ") + token;
 
     if (name == "Hash") {
-        int mb = std::stoi(value);
+        // Parse manually -- exceptions are disabled in release builds
+        // (-fno-exceptions), so std::stoi on a malformed value would call
+        // std::terminate() and crash the engine. Defensive against malformed
+        // setoption commands (e.g. "setoption name Hash value abc").
+        bool valid = !value.empty();
+        for (char c : value) if (c < '0' || c > '9') { valid = false; break; }
+        if (!valid) {
+            std::cout << "setoption: invalid Hash value\n" << std::flush;
+            return;
+        }
+        int mb = 0;
+        for (char c : value) mb = mb * 10 + (c - '0');
         TT.resize(mb);
     }
 }
@@ -239,6 +276,22 @@ void UCI::cmd_setoption(std::istringstream& ss) {
 
 void UCI::cmd_display() {
     board_.print();
+}
+
+// =============================================================================
+// COMMAND: eval (not part of UCI spec, used for evaluation debugging)
+// =============================================================================
+// Prints a per-component breakdown of the static evaluation of the current
+// position. Useful for diagnosing evaluation changes -- run "eval" before
+// and after a code change to see exactly which terms moved.
+//
+// The output shows material, PST, king safety, pawn structure, positional
+// (mobility / outposts / files / etc.), and mopup contributions, with the
+// final total from both White's perspective and the side to move's
+// perspective.
+
+void UCI::cmd_eval() {
+    evaluate_verbose(board_);
 }
 
 // =============================================================================
@@ -350,11 +403,12 @@ void UCI::cmd_perft(std::istringstream& ss) {
 // =============================================================================
 // Syntax: bench
 //         bench depth <N>
+//         bench <N>
+//         bench verbose
 //
-// Searches a fixed set of 10 positions at the given depth (default 15) and
-// reports per-position node counts and a total NPS figure. The positions are
-// chosen to stress different engine features: LMR, NMP, quiescence, king
-// safety, pawn structure, mopup, aspiration windows, and NMP zugzwang guards.
+// Searches a fixed set of 10 positions at the given depth (default 18) and
+// reports per-position node counts and a total NPS figure. Each position is
+// chosen to stress one specific engine feature (see labels below).
 //
 // Deterministic: same depth always produces the same total node count,
 // regardless of the machine. Only the elapsed time (and thus NPS) varies.
@@ -363,42 +417,47 @@ void UCI::cmd_perft(std::istringstream& ss) {
 // The TT is cleared before each position so results are independent of
 // search order. board_ is not modified (operates on a local copy).
 
+struct BenchPosition {
+    const char* label;
+    const char* fen;
+};
+
 // Bench positions: 10 hand-crafted positions covering all game phases and
-// engine features. 100% original — not copied from any other engine.
-static const char* BENCH_POSITIONS[] = {
-    // 1. Opening — Italian Game move 4. Baseline NPS, TT warm-up.
-    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+// engine features. Each label describes the phase and the primary feature
+// being exercised. 100% original -- not copied from any other engine.
+static const BenchPosition BENCH_POSITIONS[] = {
+    { "Opening, Italian Game with c3 -- baseline NPS, TT cold-cache",
+      "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/2P2N2/PP1P1PPP/RNBQK2R b KQkq - 0 4" },
 
-    // 2. Middlegame — Najdorf-like. ~35+ legal moves, stresses LMR + history.
-    "r2q1rk1/1bp1bppp/p1np1n2/1p2p3/4P3/1BP2N1P/PP1P1PP1/RNBQR1K1 w - - 0 12",
+    { "Middlegame, ~35 legal moves -- move ordering, LMR, history heuristic",
+      "r2q1rk1/1bp1bppp/p1np1n2/1p2p3/4P3/1BP2N1P/PP1P1PP1/RNBQR1K1 w - - 0 12" },
 
-    // 3. Middlegame — tactical. Captures in cascade, stresses quiescence.
-    "r1b1r1k1/pp1n1ppp/2p1p3/q2P4/1bPN4/4BN2/PP2QPPP/R3K2R w KQ - 0 12",
+    { "Middlegame with hanging exchanges -- quiescence search, SEE x-ray detection",
+      "r2qr1k1/pp1n1ppp/2pb1n2/3p4/3P4/1QPB1N2/PP3PPP/R1B1R1K1 w - - 0 13" },
 
-    // 4. Middlegame — clear material advantage. Stresses NMP pruning.
-    "r1b2rk1/pp2qppp/2n5/3p4/3Pn3/2PB1N2/PP1Q1PPP/R1B1R1K1 w - - 0 15",
+    { "Middlegame with material advantage -- null-move pruning effectiveness",
+      "r1b2rk1/pp2qppp/2n5/3p4/3Pn3/2PB1N2/PP1Q1PPP/R1B1R1K1 w - - 0 15" },
 
-    // 5. Middlegame closed — locked pawn chain. LMR + NMP guards.
-    "r1b2rk1/pp1nqppp/2n1p3/2ppP3/3P4/2PB1N2/PP1NQPPP/R1B2RK1 w - - 0 12",
+    { "Middlegame closed structure -- NMP zugzwang guards, futility margins",
+      "r1b2rk1/pp1nqppp/2n1p3/2ppP3/3P4/2PB1N2/PP1NQPPP/R1B2RK1 w - - 0 12" },
 
-    // 6. King safety — exposed king on f7, coordinated attack.
-    //    Pawn on e6 blocks the Bc4-f7 diagonal so the position is legal.
-    "r1bq1r2/ppp2kpp/2n1pn2/2b1p1B1/2B1P3/3P1N2/PPP2PPP/RN1Q1RK1 w - - 0 8",
+    { "Middlegame king attack -- king safety zone evaluation",
+      "r1bq1r2/ppp2kpp/2n1pn2/2b1p1B1/2B1P3/3P1N2/PPP2PPP/RN1Q1RK1 w - - 0 8" },
 
-    // 7. Pawn structure — passed, isolated, doubled. All eval terms active.
-    "r3r1k1/1p3pp1/p1p4p/P2pP3/1P1P4/2P2N1P/5PP1/R3R1K1 w - - 0 22",
+    { "Middlegame with pawn structure tension -- isolated/doubled/connected eval",
+      "r2q1rk1/pp1bbppp/2n1pn2/3p4/3P4/2NBPN2/PP3PPP/R1BQ1RK1 w - - 0 10" },
 
-    // 8. Endgame — rook + pawns, passed pawn on d5. Deep tree.
-    "3r2k1/pp3ppp/8/3Pp3/8/4R1P1/PP3PKP/8 w - - 0 28",
+    { "Middlegame with checking sequences -- check extensions, deep tactics",
+      "r3r1k1/pp1q1ppp/2n2n2/2bp4/3P1B2/2N2N2/PPQ1RPPP/3R2K1 w - - 0 14" },
 
-    // 9. Endgame — pure pawn, zugzwang-prone. NMP guards tested.
-    "8/8/1p1k4/pPp1p3/P1PpP3/3K4/8/8 w - - 0 40",
+    { "Endgame R+2P vs R -- deep search, passed pawn dynamics",
+      "5k2/8/8/4PP2/8/8/r7/4K2R w K - 0 1" },
 
-    // 10. Endgame — K+R vs K. Mopup evaluation active.
-    "8/8/4k3/8/8/4K3/8/3R4 w - - 0 50",
+    { "Endgame KBN vs K -- mopup corner-distance evaluation",
+      "8/8/8/4k3/8/3K4/8/4BN2 w - - 0 1" },
 };
 static constexpr int BENCH_POSITION_COUNT = 10;
-static constexpr int BENCH_DEFAULT_DEPTH  = 15;
+static constexpr int BENCH_DEFAULT_DEPTH  = 18;
 
 // Null stream buffer: discards all output. Used by bench in quiet mode to
 // suppress UCI info lines from Searcher.go() without modifying search code.
@@ -462,7 +521,7 @@ void UCI::cmd_bench(std::istringstream& ss) {
         TT.clear();
 
         Board bench_board;
-        bench_board.set_fen(BENCH_POSITIONS[i]);
+        bench_board.set_fen(BENCH_POSITIONS[i].fen);
 
         // Configure TM for a depth-limited search (no clock, no TM interference).
         // infinite=true makes soft_stop() and should_stop() always return false,
@@ -488,8 +547,13 @@ void UCI::cmd_bench(std::istringstream& ss) {
         int pos_ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
             pos_end - pos_start).count());
 
-        std::cout << "Position " << (i + 1) << "/" << BENCH_POSITION_COUNT
-                  << ": " << nodes << " nodes, " << pos_ms << " ms\n"
+        // Verbose-style summary: label, FEN, then nodes/ms.
+        // Two-digit position number (" 1/10" .. "10/10") for vertical alignment.
+        std::cout << "Position " << (i + 1 < 10 ? " " : "")
+                  << (i + 1) << "/" << BENCH_POSITION_COUNT
+                  << " -- " << BENCH_POSITIONS[i].label << "\n"
+                  << "  fen: " << BENCH_POSITIONS[i].fen << "\n"
+                  << "  " << nodes << " nodes, " << pos_ms << " ms\n\n"
                   << std::flush;
     }
 
@@ -501,6 +565,20 @@ void UCI::cmd_bench(std::istringstream& ss) {
     std::cout << "\nBench results: " << total_nodes << " nodes, "
               << total_ms << " ms, " << nps << " nps\n" << std::flush;
 }
+
+// =============================================================================
+// run_bench -- public entry point for CLI bench invocation
+// =============================================================================
+// Wraps cmd_bench() so that main.cpp can dispatch "bench" from the command
+// line without having to construct an istringstream itself or expose the
+// private command handler. The args string is parsed the same way as the
+// argument to a UCI "bench" command (e.g. "verbose depth 22").
+
+void UCI::run_bench(const std::string& args) {
+    std::istringstream ss(args);
+    cmd_bench(ss);
+}
+
 
 // =============================================================================
 // MAIN UCI LOOP
@@ -532,6 +610,7 @@ void UCI::loop() {
         else if (token == "stop")       cmd_stop();
         else if (token == "setoption")  cmd_setoption(ss);
         else if (token == "d")          cmd_display();
+        else if (token == "eval")       cmd_eval();
         else if (token == "perft")      cmd_perft(ss);
         else if (token == "bench")      cmd_bench(ss);
         else if (token == "quit") {

@@ -1,9 +1,88 @@
 # Changelog
-<!-- Last modified: 2026-04-24 14:19 -->
+<!-- Last modified: 2026-05-26 08:07 -->
 
 All notable changes to Facon will be documented here.
 
 ---
+
+## [1.5] "Espiga" -- 2026-05-26
+
+**Ordo ~2550, +~220 Elo over 1.4.** Gauntlet 3 (low-Ordo field): 800.5/1040 (77.0%, Ordo ~2550). Gauntlet 4 (high-Ordo field): 345.5/1040 (33.2%, Ordo ~2545). Combined G3+G4 Ordo: ~2550 (n=2080). CCRL 40/15 (n=20, preliminary): 2583.
+
+### Critical Bug Fixes
+
+- **`game_phase()` inversion** (`eval.cpp`): the function returned the opposite of its documented contract -- 0 in startpos (should have been 256 = middlegame) and 256 in pure endgame (should have been 0). Consumers (king_safety, pst_value for the king) were written assuming the documented contract, so they silently used the wrong tables since 1.1: king_safety returned 0 in the middlegame (zeroed by phase_mg=0), and pst_value used PST_KING_EG instead of PST_KING_MG from move 1, incentivizing centralizing the king from the opening. The fix inverts the counting: phase now starts at 0 and adds material present, instead of starting at TOTAL_PHASE and subtracting material absent. Consumers are unchanged. **Single largest source of strength gain in 1.5.**
+- **Drawn pawnless endings -- bug acknowledged, fix attempted, fix reverted** (`eval.cpp`): when `evaluate()` detects a pawnless ending with material above `MOPUP_THRESHOLD` (300cp), it calls `mopup_eval` and adds the result to the score. `mopup_eval` correctly returns 0 for theoretically drawn endings (K+B vs K, K+N vs K, K+N+N vs K, K+B+B same-color vs K), but `evaluate()` was only ADDING that 0 to a score that already contained the strong side's material count (320cp for a lone knight, 660cp for two same-color bishops, etc.). The engine evaluates these drawn endings as decisive material advantages. An override that forced the final score to 0 in these cases was implemented and tested. Although the override was technically correct, extended gauntlet testing showed it cost ~30 Elo: the override propagated through search and demotivated the engine from reaching positions whose drawn final endings it could nevertheless often avoid in practice. The override was reverted. The bug is acknowledged and listed under Known Limitations; proper resolution requires material-signature endgame recognition or Syzygy tablebase probing, planned for a future version.
+
+### Search
+
+- **Late Move Pruning (LMP)** (`search.cpp`, `search.h`): at shallow depth in non-PV nodes, once enough legal quiet moves have been searched, additional quiet moves are pruned entirely. Per-depth thresholds in `LMP_TABLE`. Captures, promotions, and killers exempt. Combined with SEE-aware capture ordering for a single shipped iteration.
+- **SEE-aware capture ordering** (`search.cpp`, `search.h`): captures are split into two ordering tiers. GOOD captures (SEE >= 0) score above killers and are tried before quiets. BAD captures (SEE < 0) score below history and are tried last. Replaces the single `ORDER_CAPTURE` constant. Shortcut: captures where attacker is no more valuable than victim (PxQ, NxR, etc.) skip the SEE call and are classified GOOD directly. Bench NPS decreased ~22% due to SEE computation on every uncertain capture, but Elo gain dominated.
+- **Internal Iterative Reductions (IIR)** (`search.cpp`, `search.h`): when a non-PV node has no TT move at sufficient depth, the depth is reduced by 1 before searching. The next visit (after the reduced search stores a move in the TT) benefits from move ordering.
+- **Countermove heuristic** (`search.cpp`, `search.h`): for each (piece, to-square) pair of the opponent's last move, the engine remembers the quiet move that caused a beta cutoff in the child node. Ordered after killers, before history. Requires passing `prev_move` through the negamax call chain.
+- **Razoring** (`search.cpp`, `search.h`): at depth 1-2 in non-PV nodes, if `eval + RAZOR_MARGIN <= alpha`, drop into qsearch immediately (`RAZOR_MAX_DEPTH = 2`, `RAZOR_MARGIN = 250cp`). A position so far below alpha that a margin of pawn-and-rook still cannot reach it is unlikely to improve in a shallow search.
+
+### Evaluation
+
+- **Knight outpost refactor** (`eval.cpp`, `eval.h`): the single `KNIGHT_OUTPOST = 20cp` constant is replaced with two graduated bonuses. `KNIGHT_OUTPOST_REACHABLE = 10cp` for knights on squares safe from pawn attack but not pawn-supported. `KNIGHT_OUTPOST_SUPPORTED = 25cp` for knights both safe AND supported by a friendly pawn (firmly anchored).
+- **Knight outpost forward_mask fix** (`eval.cpp`): the forward_mask used to disqualify outposts incorrectly included the knight's own rank, causing false-negatives when an enemy pawn sat on the same rank in an adjacent file. Pawns capture diagonally forward, so same-rank enemy pawns cannot attack the knight. Fix: forward_mask is now strictly ahead of the knight. Guarded against undefined behavior (1ULL << 64) for the edge case of a white knight on rank 8.
+
+### Transposition Table
+
+- **TT aging** (`tt.cpp`, `tt.h`, `search.h`): each search bumps a global generation counter (`current_generation`, wraps at 64). Replacement policy uses `(age * 4) + depth_loss`: an entry one generation old is treated as 4 plies shallower for replacement purposes. Allows fresh shallow results to replace deep stale ones from earlier positions. TT entry size unchanged at 16 bytes; generation is packed into the bound byte as `gen_bound = (generation << 2) | bound`.
+
+### Time Management
+
+- **`go infinite`/analysis idempotency** (`timeman.cpp`, `uci.cpp`): `start()` with no time limits sets `infinite = true`, avoiding spurious time-management activation in analysis mode.
+
+### Infrastructure
+
+- **`bench` default depth raised from 15 to 18** (`uci.cpp`): more meaningful per-position measurements. Bench signature: 299,881,540 nodes at depth 18 (deterministic, used as no-regression check).
+- **`bench` position rebalancing** (`uci.cpp`): 6 of 10 positions replaced for better time distribution. At depth 18, per-position share went from 0.01%-38.85% (1.4 set) to 2.7%-16.7% (much more uniform). Each position now carries a label describing the search feature it stresses.
+- **`bench verbose` flag** (`uci.cpp`): when present, full search output (info lines, currmove, TM messages) is emitted. Default (quiet) mode prints only per-position summary and total.
+- **`bench` `TM.infinite = true` during benchmark** (`uci.cpp`): bench now forces infinite TM during the benchmark, so node counts remain reproducible across TM tuning experiments.
+- **`bench` short-circuit on mate-in-1** (`search.cpp`): the bench positions occasionally trigger forced-mate sequences at depth 1 -- previously bench would log a "depth 0" line and continue at full TC. Now exits the iteration loop cleanly when a forced mate is found at depth 1.
+- **`eval` command** (`uci.cpp`, `eval.cpp`, `eval.h`): new UCI command that prints a per-component breakdown of `evaluate()` for the current position. Useful for tuning and debugging. Calls `evaluate_verbose()` which reproduces `evaluate()` exactly but accumulates each term separately.
+- **`evaluate_verbose()` label fixes** (`eval.cpp`): the "game_phase" line in `eval` output said "0 = endgame, 256 = middlegame", which was misleading because phase reflects non-pawn material remaining and does not distinguish opening from middlegame. Corrected to "0 = bare kings, 256 = full non-pawn material". The "skipped" reason strings for the mopup component were also clarified.
+- **Mopup insufficient material guard extended** (`eval.cpp`): the guard for theoretically drawn pawnless endings now covers K+N+N vs K and K+B+B same-color vs K, in addition to the K+B vs K and K+N vs K cases already handled in 1.4. Without these the strong side's material exceeded `MOPUP_THRESHOLD` and corner-chasing activated in drawn positions, causing the engine to refuse draws and wander. K+B+B with opposite-colored bishops continues to trigger mopup correctly (winning endgame).
+- **`cmd_setoption()` Hash parse safety** (`uci.cpp`): replaced `std::stoi()` with the same manual digit-parse pattern used by `cmd_perft()`. Release builds are compiled with `-fno-exceptions`, so `std::stoi` on a non-numeric value would call `std::terminate()` and crash the engine. Defensive against malformed setoption commands like `setoption name Hash value abc`.
+- **Final summary on aborted iteration** (`search.cpp`): when the search is interrupted mid-iteration (hard time limit hit, `stop` command), several minutes of search activity could elapse silently between the last heartbeat and the `bestmove` output. The search now emits a final `info depth` line (raw UCI format, parseable) and an `info string aborted while searching at depth N -- M nodes, h:mm:ss,ms, M nps -- using score from depth N-1: ±Xcp` line (human readable) right before `bestmove`, capturing total work done. Only emitted when the iteration in progress was actually interrupted -- no change when the search ends cleanly at iteration boundary.
+- **Command-line `bench` mode** (`main.cpp`, `uci.cpp`, `uci.h`): the binary can now be invoked as `./facon-1.5 bench [verbose] [depth N]` to run the benchmark once and exit, without going through the UCI handshake. Useful for automated NPS regression tests, CI runs, and benchmark sweeps over compilation flags. Banner and TT info are still printed when stdin is a terminal. Unknown command-line arguments produce a usage message and exit code 1.
+- **Score sign convention cleanup** (`search.cpp`): the `+` prefix on the AW fail-low/high info strings and the "new best" info string is now applied only when the score is strictly positive (previously used `>= 0`, which produced `+0cp` for exact-zero scores). Zero scores now print as `0cp` without sign, consistent with the new summary line and most other engines.
+- **`currmove` output gated by elapsed time** (`search.cpp`): UCI `info depth N currmove M currmovenumber K` lines from the root are now suppressed during the first 2 seconds of each search. At shallow depths (5-12) each root move completes in well under a millisecond, producing hundreds of currmove lines per second. This volume of stdout traffic can saturate the GUI's pipe-reader event loop in some setups, with knock-on effects on observed search throughput. After 2 seconds, `currmove` output resumes normally -- by that point the per-move time is typically long enough that each currmove line is useful rather than spam. Heartbeats, "new best" lines, and final iteration summaries are unaffected.
+
+### Build
+
+- **MSVC support removed** (`CMakeLists.txt`): the previous MSVC branch was non-functional because `bitboard.h` uses GCC/Clang builtins (`__builtin_popcountll`, `__builtin_ctzll`, `__builtin_clzll`) directly without wrappers. Keeping the dead code gave a false sense of portability. The branch has been removed and MSVC is now rejected at configure time with `FATAL_ERROR`. Native Windows builds should use MinGW-w64, either directly on Windows or via cross-compile from Linux.
+- **`-fomit-frame-pointer` added to Release builds** (`CMakeLists.txt`): frees `%rbp` as a general-purpose register in the hot search/eval paths. Measured ~+2.3% NPS over the previous flag set on Ryzen 7 1700 (Zen 1). Sole flag change from a deliberate sweep over various GCC tuning options -- other candidates (`-march=x86-64-v3`, `-Ofast`, `-frename-registers`) were rejected due to either compatibility cost or no measurable benefit.
+
+
+---
+
+## [1.4] "Hoja" -- 2026-04-24
+
+**Ordo ~2330, +430 Elo over 1.3.** Gauntlet 3: 530.5/1040 (51.0%) against 26 opponents (avg ~2310). Self-play vs 1.3: +545 Elo (95.85%, 1120 games). NPS improvement: +53% (Linux), +92% (Windows) over 1.3.
+
+### Search
+
+- **Check extension** (`search.cpp`): `if (in_check) depth++` before depth==0 qsearch entry. Forces check evasions to be resolved at full depth. +30 Elo.
+- **Static Exchange Evaluation (SEE)** (`search.cpp`, `board.h`, `board.cpp`): full exchange simulation using `all_attackers_to(sq, occ)` with x-ray discovery. Captures with SEE < 0 pruned in qsearch. Shortcut: skip SEE call when victim >= attacker (always winning).
+- **Reverse futility pruning (RFP)** (`search.cpp`, `search.h`): at depth 1-3, if `eval - 100*depth >= beta`, prune the node entirely. Like NMP without the null search.
+- **Move-level futility pruning** (`search.cpp`, `search.h`): at depth 1-2, skip quiet moves if `eval + 150*depth <= alpha`. At least one move always searched.
+- **LMR table precalculated** (`search.h`, `search.cpp`, `main.cpp`): `LMR_table[MAX_PLY][MAX_MOVES]` initialized at startup replaces per-move `log(depth)*log(move)/LMR_DIVISOR` in the hot path.
+- **Move scores computed once** (`search.cpp`): parallel scores array computed O(n), selection sort uses precomputed scores. Eliminates O(n^2) `move_score()` calls. NPS: +9%.
+- **Make/unmake legality** (`search.cpp`): `is_legal()` (which copies ~700 bytes of Board per pseudo-legal move) replaced with make, king-in-check, unmake in negamax and quiescence hot paths. NPS: +130%.
+- **Quiet queen promotions in qsearch** (`movegen.cpp`, `movegen.h`): `generate_captures()` now includes queen-promotion pushes (pawn to 8th rank without capturing). A free queen was previously invisible to qsearch.
+- **Forced move instant-play** (`search.cpp`): when only one legal move exists at root, play immediately with zero search time. Emits minimal `info depth 0` line for GUI compatibility.
+
+### Evaluation
+
+- **Piece mobility** (`eval.cpp`, `eval.h`): pseudo-legal squares per piece (excluding own pieces and enemy pawn attacks). Knight 4cp, bishop 5cp, rook 2cp, queen 1cp per square.
+- **Open/semi-open files** (`eval.cpp`, `eval.h`): rook on open file (no pawns) +20cp, semi-open (no friendly pawns) +10cp.
+- **Rook on 7th rank** (`eval.cpp`, `eval.h`): +20cp for rook on the opponent's 2nd rank.
+- **Bishop pair** (`eval.cpp`, `eval.h`): +30cp when both bishops present.
+- **Knight outposts** (`eval.cpp`, `eval.h`): +20cp for knights on ranks 4-6 (relative) that cannot be attacked by enemy pawns.
+
 
 ## [1.4] "Hoja" -- 2026-04-24
 

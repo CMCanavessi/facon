@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-19 02:33
-// search.h — Search engine declarations
+// Last modified: 2026-05-07 07:30
+// search.h -- Search engine declarations
 //
 // Implements iterative deepening with negamax alpha-beta search and
 // quiescence search. Uses the transposition table and time manager.
@@ -69,6 +69,36 @@
 //   - Futility pruning constants: RFP_MAX_DEPTH, RFP_MARGIN, FUTILITY_MAX_DEPTH,
 //     FUTILITY_MARGIN. Used by reverse futility pruning (node-level) and
 //     move-level futility pruning in negamax.
+//
+// Facon 1.5 -- Espiga
+//   - negamax() takes a new Move prev_move parameter (default MOVE_NONE),
+//     used by the countermove heuristic to look up the move that most
+//     recently refuted the opponent's last move at this node. The default
+//     argument keeps existing call sites (root entry from go(), NMP
+//     recursion) compatible without code changes.
+//   - move_score() and sort_moves() take a new Move countermove parameter,
+//     pre-computed once per node by the caller. Inserted as a new ordering
+//     tier (ORDER_COUNTERMOVE = 65000) between killer2 (80000) and history
+//     (max 50000).
+//   - countermoves_[15][64]: new table indexed by [piece][to_square]. The
+//     first dimension is sized 15 because the Piece enum uses non-contiguous
+//     values (0=NO_PIECE, 1..6=W_PAWN..W_KING, 9..14=B_PAWN..B_KING).
+//     Reset along with killers_ and history_ at the start of each search.
+//   - Internal Iterative Reductions (IIR_MIN_DEPTH = 4): at PV nodes
+//     without a TT hit, depth is reduced by 1 to avoid wasting nodes on
+//     poorly-ordered first moves.
+//   - Razoring (RAZOR_MAX_DEPTH = 2, RAZOR_MARGIN = 250): non-PV nodes at
+//     shallow depth where static_eval falls far below alpha drop into a
+//     quiescence verification that may return early.
+//   - Late Move Pruning (LMP_MAX_DEPTH = 6): in non-PV nodes at shallow
+//     depth, after enough legal quiet moves have been searched, additional
+//     quiets are pruned entirely. Per-depth thresholds in LMP_TABLE
+//     (search.cpp). Captures, promotions, and killers are exempt.
+//   - SEE-aware capture ordering: captures are split into GOOD (SEE >= 0,
+//     scored above killers) and BAD (SEE < 0, scored below history).
+//     Replaces the single ORDER_CAPTURE constant. SEE is computed only
+//     when needed; captures with attacker no more valuable than victim
+//     skip the SEE call as they are always favorable.
 // =============================================================================
 
 #pragma once
@@ -129,6 +159,18 @@ public:
     // Used by the bench command to report per-position and total node counts.
     uint64_t total_nodes() const { return stats_.nodes + stats_.qnodes; }
 
+    // -------------------------------------------------------------------------
+    // PUBLIC SEARCH CONFIGURATION CONSTANTS
+    // -------------------------------------------------------------------------
+    // Constants used by structures defined outside the class (e.g. LMP_TABLE
+    // in search.cpp) must be public to be accessible from the global scope.
+
+    // Maximum depth where LMP applies. Beyond this, threshold is too large
+    // to provide meaningful savings vs the risk of pruning a critical move.
+    // Used by LMP_TABLE (defined in search.cpp) to size and index the
+    // per-depth move-count threshold array.
+    static constexpr int LMP_MAX_DEPTH = 6;
+
 private:
     SearchStats stats_;
 
@@ -162,6 +204,22 @@ private:
     // range relative to ORDER_KILLER2. Reset at the start of each search.
     static constexpr int HISTORY_MAX = 50000;  // Below ORDER_KILLER2 (80000)
     int history_[2][64][64];                   // [color][from][to]
+
+    // Countermove table: for each (piece, to_square) of the previous move
+    // played, remembers the quiet move that refuted it (caused a beta cutoff)
+    // most recently. Used as an additional move ordering tier between killers
+    // and history.
+    //
+    // Indexed by [piece][to_square]. The Piece enum uses values 0..14 with
+    // gaps (1..6 for WPAWN..WKING, 9..14 for BPAWN..BKING, 0 for NO_PIECE),
+    // so we size the first dimension to 15 to accommodate the maximum value.
+    // Color is part of the index so refutations to white's pawn-to-e4 are
+    // kept separate from refutations to black's pawn-to-e4 -- they are
+    // different positions with different responses.
+    //
+    // Total size: 15 * 64 * 4 bytes = 3840 bytes. Negligible.
+    // Reset at the start of each search alongside killers_ and history_.
+    Move countermoves_[15][64];
 
     // Triangular PV array: stores the principal variation at each ply.
     // pv_table_[ply] holds the PV line from that ply to the end of the search.
@@ -237,6 +295,90 @@ private:
     // Margin per depth level for move-level futility pruning (centipawns).
     // At depth d, skip quiet moves if eval + FUTILITY_MARGIN * d <= alpha.
     static constexpr int FUTILITY_MARGIN = 150;
+
+    // -------------------------------------------------------------------------
+    // INTERNAL ITERATIVE REDUCTIONS (IIR)
+    // -------------------------------------------------------------------------
+    // When a node has no TT move available, move ordering at this node is
+    // less reliable. Rather than searching at full depth with a poor first
+    // move, reduce the depth by 1 and let a shallower search produce a
+    // better ordering signal that propagates back via the TT.
+    // Applied only at PV nodes (where window > 1) -- in non-PV nodes the
+    // ordering quality matters less because we expect cutoffs anyway.
+
+    // Minimum depth for IIR. Below this, the savings from reducing are
+    // negligible and the loss of accuracy is not worth it.
+    static constexpr int IIR_MIN_DEPTH = 4;
+
+    // -------------------------------------------------------------------------
+    // RAZORING
+    // -------------------------------------------------------------------------
+    // At very shallow depths, if static_eval is so far below alpha that even
+    // a generous margin does not bring it close, drop directly into quiescence
+    // instead of doing a full search. This is the dual of RFP: RFP prunes
+    // when we are clearly above beta, razoring prunes when we are clearly
+    // below alpha. Applied only at non-PV nodes.
+
+    // Maximum depth for razoring. Standard value used by HCE engines.
+    static constexpr int RAZOR_MAX_DEPTH = 2;
+
+    // Margin per depth level for razoring (centipawns). At depth d, razor
+    // is considered if static_eval + RAZOR_MARGIN * d < alpha. Then a
+    // quiescence verification is run; if it confirms eval is well below
+    // alpha, we return the qsearch score and skip the full search.
+    static constexpr int RAZOR_MARGIN = 250;
+
+    // -------------------------------------------------------------------------
+    // COUNTERMOVE HEURISTIC
+    // -------------------------------------------------------------------------
+    // For each (piece, to_square) of the opponent's previous move, remember
+    // which quiet move of ours refuted it. Used as an additional ordering
+    // tier between killers and history.
+
+    // Move ordering bonus for the countermove. Sits below ORDER_KILLER2
+    // (80000) and above HISTORY_MAX (50000), so ordering tiers are:
+    //   TT_MOVE (1,000,000) > captures (100,000+) > killer1 (90,000)
+    //   > killer2 (80,000) > countermove (65,000) > history (0..50,000)
+    static constexpr int ORDER_COUNTERMOVE = 65000;
+
+    // -------------------------------------------------------------------------
+    // LATE MOVE PRUNING (LMP)
+    // -------------------------------------------------------------------------
+    // After searching enough quiet moves at shallow depth in non-PV nodes,
+    // the remaining quiets are unlikely to produce a beta cutoff that the
+    // earlier ones missed. Skip them entirely. This is the dual of LMR --
+    // LMR reduces depth, LMP cuts the move out of the search.
+    //
+    // The threshold per depth is taken from a precomputed table indexed by
+    // depth (0..LMP_MAX_DEPTH). At depth d, only the first LMP_TABLE[d]
+    // legal quiet moves are searched; any later quiet move is pruned.
+    // Captures, promotions, killers, and check evasions are exempt.
+    //
+    // LMP_MAX_DEPTH is declared in the public section (above) so LMP_TABLE
+    // in search.cpp can size and index by it from the global scope.
+
+    // -------------------------------------------------------------------------
+    // SEE-AWARE CAPTURE ORDERING
+    // -------------------------------------------------------------------------
+    // Captures are split into two ordering tiers based on Static Exchange
+    // Evaluation (SEE):
+    //   GOOD captures (SEE >= 0): material is recovered or gained. Ordered
+    //       above killers so winning captures are tried first.
+    //   BAD captures (SEE < 0): the capturing side loses material in the
+    //       eventual exchange. Ordered below history (i.e. below all
+    //       quiet moves) so they are tried last, after the search has
+    //       considered safer alternatives.
+    //
+    // To avoid the cost of computing SEE for every capture, we skip SEE
+    // for "obviously good" captures (attacker value <= victim value).
+    // PxQ, NxQ, BxR, etc. are always GOOD captures because even if the
+    // capturing piece is lost, the trade is favorable.
+
+    // Capture ordering bonuses. GOOD sits above ORDER_KILLER1 (90000),
+    // BAD sits below all history values (0..50000) and below 0.
+    // MVV-LVA (max ~605 for PxQ) is added to break ties within each tier.
+    static constexpr int ORDER_CAPTURE_GOOD = 110000;
+    static constexpr int ORDER_CAPTURE_BAD  = -100000;
 
     // -------------------------------------------------------------------------
     // ASPIRATION WINDOW PARAMETERS
@@ -324,8 +466,13 @@ private:
     //   do_null = whether null move pruning is allowed at this node.
     //             Set to false for the node immediately after a null move to
     //             prevent two consecutive null moves (infinite loop / unsound pruning).
+    //   prev_move: the move played by the opponent to reach this node (i.e.
+    //             the most recent move on the board). Used by the countermove
+    //             heuristic to find the move that refuted prev_move when this
+    //             node was reached previously. MOVE_NONE at the root and
+    //             after a null move (no real previous move).
     Score negamax(Board& board, Score alpha, Score beta, int depth, int ply,
-                  bool do_null = true);
+                  bool do_null = true, Move prev_move = MOVE_NONE);
 
     // Quiescence search: called at depth=0 to resolve tactical sequences.
     // Searches captures only until the position is "quiet".
@@ -340,13 +487,18 @@ private:
     // Returns a score for a move used to determine search order.
     // Higher score = search this move earlier.
     // Takes ply to look up killer moves for this node.
-    int move_score(const Board& board, Move m, Move tt_move, int ply) const;
+    // countermove is the precomputed countermove for this node (looked up
+    // once per node from countermoves_ using the parent's prev_move). If
+    // MOVE_NONE, no countermove ordering bonus applies.
+    int move_score(const Board& board, Move m, Move tt_move,
+                   Move countermove, int ply) const;
 
     // Sort moves in-place from index 'start' onward using selection sort.
     // Selection sort is simple and fast enough for typical move list sizes (~30-50).
     // Takes ply to pass through to move_score for killer lookup.
+    // countermove is passed through to move_score for ordering.
     void sort_moves(const Board& board, MoveList& moves,
-                    int start, Move tt_move, int ply) const;
+                    int start, Move tt_move, Move countermove, int ply) const;
 
     // Store a killer move for the given ply.
     // Does nothing if the move is already in slot 0.
