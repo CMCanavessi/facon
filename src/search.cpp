@@ -1,8 +1,8 @@
 // =============================================================================
-// Last modified: 2026-05-19 13:55
+// Last modified: 2026-05-29 10:23
 // search.cpp -- Negamax alpha-beta search with iterative deepening
 //
-// Facon 1.1 — Herrumbre
+// Facon 1.1 -- Herrumbre
 //
 //   KILLER MOVES (search improvement):
 //     Quiet moves that cause a beta cutoff are stored as "killers" for that ply.
@@ -25,7 +25,7 @@
 //     root_best_move_: the best move at ply 0 is saved directly inside
 //     negamax() whenever a new best is found at the root. We never do TT
 //     early returns at ply 0, so root_best_move_ is always set from the
-//     actual move loop — never from a potentially stale or collided TT entry.
+//     actual move loop -- never from a potentially stale or collided TT entry.
 //
 //     safe_move: pre-seeded before the loop with the first legal move found
 //     from generate_all_moves(). Last-resort fallback that guarantees
@@ -44,7 +44,7 @@
 //     If the PV move changed or the score dropped significantly, the soft limit
 //     is extended to give the engine more time on difficult positions.
 //
-// Facon 1.2 — Rojo Vivo
+// Facon 1.2 -- Rojo Vivo
 //
 //   SINGLE MOVE GENERATION IN TT PROBE PATH (cleanup):
 //     In 1.1, negamax() called generate_all_moves() twice per node when a TT
@@ -52,7 +52,7 @@
 //     again for the main move loop. Fixed by generating the list once before
 //     the TT probe and reusing it for both purposes.
 //
-//   NULL MOVE PRUNING — NMP (search improvement):
+//   NULL MOVE PRUNING -- NMP (search improvement):
 //     If the side to move can pass without moving and the resulting search at
 //     (depth - 1 - NMP_REDUCTION) still returns a score >= beta, the position
 //     is likely so good that a cutoff is safe. Disabled in check, at the root,
@@ -71,7 +71,7 @@
 //     the resulting hash appears in seen[], the move is not printed and the
 //     walk stops. This prevents the GUI warning "PV continues after threefold
 //     repetition". The underlying root cause was the unmake_move() hash
-//     corruption fixed in board.cpp — the alternating root hash between ID
+//     corruption fixed in board.cpp -- the alternating root hash between ID
 //     iterations caused seen[] lookups to fail silently.
 //
 //   VERBOSITY (observability):
@@ -79,7 +79,7 @@
 //     long time controls:
 //
 //     currmove: at the root (ply==0), emit "info currmove X currmovenumber N"
-//       before searching each move. Standard UCI fields — GUIs display this
+//       before searching each move. Standard UCI fields -- GUIs display this
 //       in a dedicated panel. Lets the operator see which move is being
 //       explored in real time. Suppressed during the first 2 seconds of
 //       search to avoid stdout spam at shallow depths (where currmove changes
@@ -123,7 +123,7 @@
 //     dropped the last position from tracking. Fixed by declaring
 //     seen[MAX_GAME_HISTORY + MAX_PLY + 2].
 //
-// Facon 1.3 — Yunque (post-gauntlet fixes)
+// Facon 1.3 -- Yunque (post-gauntlet fixes)
 //
 //   MATE REDUCTION ONE-SHOT (bugfix):
 //     is_mate_score(last_score) is true on every iteration once a mate is
@@ -137,7 +137,7 @@
 //     (25, an internal TM constant in timeman.cpp) and the new soft would exceed
 //     the hard limit, hard is raised to match soft (capped at 50% of remaining
 //     clock) instead of capping soft at hard. Both limits then rise together on
-//     subsequent extensions. Only triggered by real instability — a stable
+//     subsequent extensions. Only triggered by real instability -- a stable
 //     position at depth 25+ would have already fired the easy-move reduction.
 //     TM.raise_emergency_limit() removed; EMERGENCY_DEPTH removed from search.h.
 //
@@ -160,13 +160,13 @@
 //     (1154) in 1.2, but the insertion guard still used MAX_GAME_HISTORY + MAX_PLY
 //     (1152), stopping 2 entries early. Updated the guard to match the array size.
 //
-// Facon 1.3 — Yunque
+// Facon 1.3 -- Yunque
 //
 //   DEPTH == 0 (prerequisite for LMR):
 //     Changed quiescence entry condition from depth <= 0 to depth == 0.
 //     With LMR, nodes can be called with a reduced depth that is already 0;
 //     we want to enter quiescence exactly at that point. A negative depth
-//     no longer silently enters quiescence — it causes a search hang,
+//     no longer silently enters quiescence -- it causes a search hang,
 //     making depth bugs immediately detectable. All reduction call sites
 //     use std::max(0, reduced_depth) to ensure depth never goes negative.
 //
@@ -186,7 +186,7 @@
 //     reduce_time() is called after each completed iteration when the
 //     position is clearly resolved: mate found (x0.05), single legal move
 //     (x0.1), or PV+score stable for 7+ consecutive iterations at depth > 12
-//     (x EASY_REDUCE_FACTOR=0.40 — one-shot cut). The easy move trigger uses
+//     (x EASY_REDUCE_FACTOR=0.40 -- one-shot cut). The easy move trigger uses
 //     == not >= to fire exactly once. If instability is later detected (PV
 //     change or score drop), cancel_easy_move() restores the soft limit
 //     before applying the extension so the extension acts on the full value.
@@ -203,7 +203,7 @@
 //     history_[color][from][to] is incremented by depth^2 whenever a quiet
 //     move causes a beta cutoff. In move_score(), quiet moves return their
 //     history score instead of the flat ORDER_QUIET=0. This gives the move
-//     ordering meaningful differentiation among quiet moves — historically good
+//     ordering meaningful differentiation among quiet moves -- historically good
 //     moves rise in the list and are less likely to be LMR-reduced.
 //     Table is capped at HISTORY_MAX and reset at the start of each search.
 //
@@ -214,19 +214,19 @@
 //     we widen the window and re-search. Most iterations stay inside the
 //     window and save significant node count. Only applied from depth >= 4
 //     (below that the score is too unstable to trust for windowing).
-//     Also bypassed when the previous score is a mate score — a window of
+//     Also bypassed when the previous score is a mate score -- a window of
 //     +/-50cp around a mate score can produce pathological re-searches.
 //     Initial window: +/- ASP_WINDOW (50cp). On each failure, the window
 //     doubles on the failing side until the score fits or the window reaches
 //     SCORE_INFINITE (full window, equivalent to no aspiration).
 //
 // Move ordering tiers (highest to lowest):
-//   1. TT move    — best move from a previous search at this position
-//   2. Captures   — ordered by MVV-LVA (Most Valuable Victim, Least Valuable Attacker)
-//   3. Promotions — treated similarly to captures
-//   4. Killer 1   — most recent quiet move that caused a beta cutoff at this ply
-//   5. Killer 2   — second killer move at this ply
-//   6. Quiet moves — ordered by history score (higher = caused more beta cutoffs)
+//   1. TT move    -- best move from a previous search at this position
+//   2. Captures   -- ordered by MVV-LVA (Most Valuable Victim, Least Valuable Attacker)
+//   3. Promotions -- treated similarly to captures
+//   4. Killer 1   -- most recent quiet move that caused a beta cutoff at this ply
+//   5. Killer 2   -- second killer move at this ply
+//   6. Quiet moves -- ordered by history score (higher = caused more beta cutoffs)
 //
 // Facon 1.4 -- Hoja
 //
@@ -239,27 +239,28 @@
 //     The per-move reduction formula log(depth)*log(move)/LMR_DIVISOR is now
 //     precomputed into LMR_table[MAX_PLY][MAX_MOVES] at startup. The hot path
 //     in negamax replaces two log() calls and a division with a single array
-//     lookup. Same formula, same results — pure speedup.
+//     lookup. Same formula, same results -- pure speedup.
 //
 //   MOVE SCORES COMPUTED ONCE (speedup):
 //     sort_moves() previously called move_score() on every comparison in
-//     the selection sort — O(n^2) calls for n moves. Now scores are computed
+//     the selection sort -- O(n^2) calls for n moves. Now scores are computed
 //     once into a parallel array (O(n) calls), and the sort operates on the
 //     precomputed scores. The scores array is swapped in parallel with moves.
 //
 //   MAKE/UNMAKE LEGALITY (speedup):
 //     negamax() and quiescence() no longer call is_legal() (which copies the
-//     entire Board struct ~700 bytes per pseudo-legal move). Instead, the move
-//     is made on the real board, the king-in-check test is performed directly,
-//     and if the move is illegal it is unmade. Legal moves proceed to search
-//     and are unmade after. Eliminates ~30 Board copies per node.
+//     entire Board struct -- about 16 KB per pseudo-legal move, since Board
+//     embeds a 1024-entry StateInfo history array). Instead, the move is made
+//     on the real board, the king-in-check test is performed directly, and if
+//     the move is illegal it is unmade. Legal moves proceed to search and are
+//     unmade after. Eliminates ~30 Board copies per node.
 //     is_legal() is unchanged and still used by non-hot-path callers (perft,
 //     move_to_san, PV walk, root move counting, parse_move).
 //
 //   FACON_DEBUG DIAGNOSTIC COUNTERS:
 //     When compiled with -DFACON_DEBUG, LMR/NMP/TT counters are incremented
 //     in the search and reported via "info string ST:" after each completed
-//     iteration. Zero cost in release builds — all behind #ifdef.
+//     iteration. Zero cost in release builds -- all behind #ifdef.
 //
 //   CHECK EXTENSION:
 //     When the side to move is in check, depth is extended by 1. Being in
@@ -276,7 +277,7 @@
 //
 //   REVERSE FUTILITY PRUNING (RFP):
 //     At shallow depths (1-3), if the static eval minus a margin already
-//     exceeds beta, the node is pruned entirely — like a cheaper NMP without
+//     exceeds beta, the node is pruned entirely -- like a cheaper NMP without
 //     the null move search. Margin: 100cp per depth level.
 //
 //   MOVE-LEVEL FUTILITY PRUNING:
@@ -377,6 +378,39 @@
 //     Affects the AW fail-low/high info strings, the "new best" info
 //     string, and the final summary above. Zero scores now print as
 //     "0cp" without sign, consistent with most other engines.
+//
+// Facon 1.6 -- Temple
+//
+//   SEE KING-CAPTURE LEGALITY GUARD (correctness fix):
+//     Static Exchange Evaluation modelled the king as an ordinary attacker
+//     and let it recapture on the target square even when that square was
+//     still defended by the opposing side. A king cannot legally capture
+//     into a defended square (it would move into check), so this produced
+//     an illegal recapture in the swap-off. Because the king's piece value
+//     is 0, the phantom king capture then drove the SEE of the original
+//     move spuriously negative. A losing-looking SEE both mis-orders the
+//     move (it sinks below all quiet moves) and, more damagingly, causes it
+//     to be pruned in quiescence, hiding sound tactics -- most commonly in
+//     endgames where a pawn is defended only by the enemy king while the
+//     side to move controls the capture square through an x-ray. Fixed by a
+//     guard inside see(): when the cheapest remaining attacker is the king
+//     and the opponent still attacks the square, the exchange terminates
+//     instead of counting the (illegal) king recapture. The guard fires
+//     only in the cases where the king recapture would have been illegal;
+//     every other exchange is scored exactly as before. SEE still ignores
+//     pins, which is the standard limitation of a lightweight SEE and is
+//     unchanged here. This alters move ordering and quiescence pruning, so
+//     the bench signature changes (expected for a logic change) and the
+//     change is measured against the previous development version by
+//     self-play, kept on correctness grounds even if the Elo delta is
+//     neutral.
+//
+//   COMMENT AUDIT AND ASCII CLEANUP (no functional change):
+//     Comments across this file revised for completeness and didactic
+//     clarity, and non-ASCII punctuation (em dashes) replaced with ASCII
+//     "--" so every byte reaching a terminal or an editor is portable.
+//     No code paths were altered by this pass; only the SEE guard above
+//     changes behavior.
 // =============================================================================
 
 #include "search.h"
@@ -389,7 +423,7 @@
 // Global instance
 Search Searcher;
 
-// LMR reduction table — precomputed at startup by init_lmr_table().
+// LMR reduction table -- precomputed at startup by init_lmr_table().
 int LMR_table[MAX_PLY][MAX_MOVES];
 
 void init_lmr_table() {
@@ -492,13 +526,55 @@ static int see(const Board& board, Move m) {
         Bitboard side_attackers = attackers & board.by_color[side];
         if (!side_attackers) break;
 
-        // Find the cheapest attacker (PAWN < KNIGHT < BISHOP < ROOK < QUEEN < KING)
+        // Find the cheapest attacker (PAWN < KNIGHT < BISHOP < ROOK < QUEEN < KING).
+        // The cheapest-first order is what makes the exchange optimal: a side
+        // always recaptures with its least valuable piece to minimize what it
+        // risks losing on the next recapture.
         PieceType pt;
         for (pt = PAWN; pt <= KING; pt = PieceType(pt + 1)) {
             if (side_attackers & board.pieces[pt]) break;
         }
 
-        // Negamax gain: what we capture minus what the previous side gained
+        // King-capture legality guard.
+        // A king may capture on the target square ONLY if the opposing side has
+        // no remaining attacker there: capturing into a defended square would
+        // move the king into check, which is illegal. The cheapest-attacker
+        // loop above selects the king only when it is this side's sole
+        // remaining attacker (every cheaper piece type was already exhausted),
+        // so reaching this point with pt == KING means the king is the only
+        // piece that could perform this recapture. If the opponent still
+        // attacks the square, that recapture cannot happen and the exchange
+        // ends here -- with no king capture counted.
+        //
+        // Without this guard the swap-off wrongly lets the king recapture into
+        // a defended square. Because PIECE_VALUE[KING] is 0, the phantom king
+        // capture then produces a spuriously negative SEE for the original
+        // move. Concrete example: White Re2 (with Re1 behind it as an x-ray
+        // defender) takes a black pawn on e5 defended only by the black king on
+        // e6. The real value is +100 (White wins the pawn cleanly, since Kxe5
+        // is illegal -- e5 stays covered by Re1). Without the guard SEE assumes
+        // Kxe5, then Rxe5, and reports -400 (as if White loses the rook). That
+        // wrong negative would order the capture as a losing capture and, worse,
+        // prune it in quiescence -- making the engine blind to a sound tactic.
+        // The guard yields the correct +100.
+        //
+        // Break safety: d was incremented at the top of this iteration but
+        // gain[d] has NOT been written yet. The backward-propagation loop below
+        // starts with `--d`, so it reads gain[d-1] downward and never touches
+        // the unwritten gain[d]. Breaking here is therefore safe and leaves
+        // gain[] consistent.
+        //
+        // Like all simple SEE, this still ignores pins (a pinned defender is
+        // treated as a real defender even when it cannot legally recapture).
+        // Pin-awareness is a separate, larger approximation not addressed here.
+        if (pt == KING && (attackers & board.by_color[~side]))
+            break;
+
+        // Negamax gain: the value of the piece we just captured minus what the
+        // previous side stood to gain. Subtracting the previous gain expresses
+        // the alternating nature of the exchange (each capture is a response to
+        // the last), so a positive gain[d] means this recapture is favorable
+        // for the side to move at this step.
         gain[d] = PIECE_VALUE[attacker_type] - gain[d - 1];
 
         // Pruning: if even capturing for free can't beat the current best,
@@ -641,7 +717,7 @@ void Search::sort_moves(const Board& board, MoveList& moves,
 }
 
 void Search::store_killer(Move m, int ply) {
-    // Don't store the same move twice — it's already in slot 0
+    // Don't store the same move twice -- it's already in slot 0
     if (m == killers_[ply][0]) return;
     // Shift the current best killer to slot 1, store the new one in slot 0
     killers_[ply][1] = killers_[ply][0];
@@ -701,9 +777,9 @@ Score Search::quiescence(Board& board, Score alpha, Score beta, int ply) {
         // SEE pruning: skip captures with a negative exchange value.
         // A losing capture (e.g. QxP where the pawn is defended) wastes time
         // exploring a line that will fail low. Quiet queen promotions (no
-        // victim on the target square) are exempt — they are always good.
+        // victim on the target square) are exempt -- they are always good.
         // Shortcut: if the victim is worth >= the attacker, the capture is
-        // always winning or equal — skip the full SEE computation.
+        // always winning or equal -- skip the full SEE computation.
         if (board.piece_at(to_sq(m)) != NO_PIECE) {
             PieceType vic = type_of(board.piece_at(to_sq(m)));
             PieceType att = type_of(board.piece_at(from_sq(m)));
@@ -714,8 +790,9 @@ Score Search::quiescence(Board& board, Score alpha, Score beta, int ply) {
         board.make_move(m);
 
         // Legality check: does the move leave our king in check?
-        // Same make/unmake approach as negamax — avoids the ~700 byte Board
-        // copy that is_legal() would perform.
+        // Same make/unmake approach as negamax -- avoids the ~16 KB Board
+        // copy that is_legal() would perform (Board embeds a 1024-entry
+        // history array).
         if (board.is_attacked(board.king_square(~board.side_to_move),
                               board.side_to_move)) {
             board.unmake_move(m);
@@ -743,7 +820,7 @@ Score Search::quiescence(Board& board, Score alpha, Score beta, int ply) {
 //
 // Alpha = best score the current player is guaranteed so far
 // Beta  = best score the opponent is guaranteed so far
-// If score >= beta, the opponent won't allow this position — prune.
+// If score >= beta, the opponent won't allow this position -- prune.
 
 Score Search::negamax(Board& board, Score alpha, Score beta,
                        int depth, int ply, bool do_null, Move prev_move) {
@@ -759,9 +836,9 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 
     // Time check: every 2048 negamax nodes to minimize overhead.
     // Note: quiescence() has its own identical check using stats_.qnodes,
-    // because stats_.nodes is never incremented there — during deep tactical
+    // because stats_.nodes is never incremented there -- during deep tactical
     // sequences the negamax counter is frozen and this check would never fire.
-    // Set the abort flag instead of returning directly — this ensures every
+    // Set the abort flag instead of returning directly -- this ensures every
     // level of the call stack sees the flag and returns, so all make_move()
     // calls are matched by unmake_move() calls and the board stays consistent.
     if ((stats_.nodes & 2047) == 0 && TM.should_stop()) {
@@ -771,7 +848,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 
     // Heartbeat: if no SUBSTANTIVE output has been emitted for
     // HEARTBEAT_INTERVAL_MS, print a status line. Uses last_heartbeat_ms_,
-    // not last_output_ms_ — currmove lines must not reset this timer, since
+    // not last_output_ms_ -- currmove lines must not reset this timer, since
     // they carry no status info and would otherwise suppress the heartbeat
     // during long iterations with many root moves.
     if ((stats_.nodes & 2047) == 0) {
@@ -804,7 +881,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     if (ply >= MAX_PLY - 1)
         return evaluate(board);
 
-    // Compute in_check once — used for check extension, NMP guard, LMR guard,
+    // Compute in_check once -- used for check extension, NMP guard, LMR guard,
     // and checkmate detection. Avoids calling board.in_check() multiple times.
     bool in_check = board.in_check();
 
@@ -812,7 +889,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // CHECK EXTENSION
     // -------------------------------------------------------------------------
     // When the side to move is in check, extend the search by one ply.
-    // Being in check is a forcing situation — the side to move has very few
+    // Being in check is a forcing situation -- the side to move has very few
     // legal responses (often just 1-3). Dropping into quiescence while in
     // check would miss critical evasions. The extension ensures that check
     // sequences are resolved at full depth before evaluation.
@@ -837,7 +914,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // Generate the full move list once here and reuse it throughout this node:
     // for TT move validation below, and for the main move loop further down.
     // Generating twice (once for validation, once for the loop) was the 1.1
-    // behavior — eliminated as part of the 1.2 pre-work cleanup.
+    // behavior -- eliminated as part of the 1.2 pre-work cleanup.
     MoveList moves;
     generate_all_moves(board, moves);
 
@@ -938,7 +1015,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // At shallow depths, if the static evaluation is so far above beta that
     // even a significant score drop would not bring it below beta, return
     // immediately. This is like a cheaper version of NMP that does not require
-    // a null move search — just a static eval comparison.
+    // a null move search -- just a static eval comparison.
     //
     // Guards: not in check, not at root, shallow depth (1-3).
     // Margin: 100cp per depth level (d1=100, d2=200, d3=300).
@@ -991,18 +1068,18 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // The null move search uses a zero window (-beta, -beta+1): we only need
     // to detect a beta cutoff, not measure the exact score.
     //
-    // Guards — NMP is disabled when:
+    // Guards -- NMP is disabled when:
     //   1. do_null == false: the previous move was already a null move.
     //      Two consecutive null moves (passes) is unsound and causes the
     //      search to loop. do_null is set to false for the recursive call.
     //   2. in_check: passing while in check is illegal and the zugzwang
-    //      argument breaks down — any move might be forced.
+    //      argument breaks down -- any move might be forced.
     //   3. ply == 0: we never prune at the root; root_best_move_ must be
     //      set from the actual move loop.
     //   4. depth < NMP_MIN_DEPTH: at shallow depths the cost of the reduced
     //      search is not worth the potential pruning benefit.
     //   5. No non-pawn material: in positions with only pawns and kings,
-    //      zugzwang is common — passing the move can be genuinely terrible.
+    //      zugzwang is common -- passing the move can be genuinely terrible.
     //      We check that the side to move has at least one piece beyond pawns
     //      and king before allowing NMP.
     if (   do_null
@@ -1108,9 +1185,10 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         board.make_move(m);
 
         // Legality check via make/unmake: instead of copying the entire Board
-        // (~700 bytes) in is_legal(), we make the move on the real board and
-        // check if our king is left in check. If illegal, unmake and skip.
-        // After make_move, side_to_move has flipped — our king (the side that
+        // (~16 KB, dominated by its 1024-entry history array) in is_legal(),
+        // we make the move on the real board and check if our king is left in
+        // check. If illegal, unmake and skip.
+        // After make_move, side_to_move has flipped -- our king (the side that
         // just moved) is ~side_to_move, and the attacker is side_to_move.
         if (board.is_attacked(board.king_square(~board.side_to_move),
                               board.side_to_move)) {
@@ -1137,12 +1215,12 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         }
 
         // currmove: at the root, emit which move is being explored and its
-        // position in the ordered list. Standard UCI fields — GUIs display
+        // position in the ordered list. Standard UCI fields -- GUIs display
         // this in a dedicated panel. Not emitted at depth 1 (too fast to
         // be meaningful), in inner nodes (ply > 0), or before 2 seconds of
         // search elapsed (suppressing the high-frequency currmove spam at
         // shallow depths reduces stdout pressure on the GUI's pipe reader
-        // without losing useful information — by 2s into the search the
+        // without losing useful information -- by 2s into the search the
         // depth is typically deep enough that each move takes long enough
         // to be worth reporting).
         if (ply == 0 && current_depth_ > 1) {
@@ -1153,7 +1231,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                           << " currmovenumber "  << legal_count
                           << "\n" << std::flush;
                 last_output_ms_ = now;
-                // Note: last_heartbeat_ms_ is NOT updated here — currmove
+                // Note: last_heartbeat_ms_ is NOT updated here -- currmove
                 // lines fire at high frequency and must not suppress the
                 // heartbeat during long iterations.
             }
@@ -1169,7 +1247,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         Score score;
         if (do_lmr) {
             // Reduction from precomputed table (initialized at startup).
-            // Floored at 1 and capped so reduced_depth >= 1 — we never LMR
+            // Floored at 1 and capped so reduced_depth >= 1 -- we never LMR
             // directly into quiescence (depth == 0).
             int reduction     = std::max(1, LMR_table[depth][legal_count]);
             int reduced_depth = std::max(1, depth - 1 - reduction);
@@ -1208,7 +1286,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 
             // At the root (ply 0), record the best move directly.
             // We never do TT early returns at the root, so this is always set
-            // from the actual move loop — guaranteed to be legal in the current
+            // from the actual move loop -- guaranteed to be legal in the current
             // position and independent of TT state (always-replace can overwrite
             // the root entry during the search before go() reads it back).
             if (ply == 0) {
@@ -1255,7 +1333,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                     last_heartbeat_ms_ = now;
                     // new-best is substantive output (a genuinely new best
                     // move was found at the root) so it resets the heartbeat
-                    // timer. currmove lines do NOT reset it — they fire at
+                    // timer. currmove lines do NOT reset it -- they fire at
                     // high frequency and carry no status info.
                 }
             }
@@ -1266,7 +1344,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                 // Update the triangular PV array.
                 // We copy this move into pv_table_[ply][0], then append the
                 // child's PV (pv_table_[ply+1]) to build the full line from
-                // this ply onward. This only happens when alpha is raised —
+                // this ply onward. This only happens when alpha is raised --
                 // a move that fails low (score <= alpha) does not belong in
                 // the PV even if it is the best move seen so far.
                 pv_table_[ply][0] = m;
@@ -1317,7 +1395,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // CHECKMATE AND STALEMATE
     // -------------------------------------------------------------------------
     if (legal_count == 0) {
-        // in_check was computed before the move loop — reuse it here.
+        // in_check was computed before the move loop -- reuse it here.
         return in_check
             ? -SCORE_MATE + ply  // Checkmate: prefer faster mates (lower ply)
             : SCORE_DRAW;        // Stalemate
@@ -1334,7 +1412,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 }
 
 // =============================================================================
-// ITERATIVE DEEPENING — TOP LEVEL
+// ITERATIVE DEEPENING -- TOP LEVEL
 // =============================================================================
 // Search at depth 1, 2, 3, ... until time runs out.
 // Each iteration uses results from the previous one (via the TT) to search
@@ -1343,14 +1421,14 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 //
 // Best move resolution per iteration (priority order):
 //   1. root_best_move_: set directly in negamax() when ply==0 finds a new best.
-//      Always comes from the actual move loop — we never do TT early returns
+//      Always comes from the actual move loop -- we never do TT early returns
 //      at the root, so this is guaranteed to be a legal move in the position.
 //   2. safe_move: pre-seeded before the loop with the first legal move.
-//      Last resort — guarantees bestmove is never "0000" under any circumstances,
+//      Last resort -- guarantees bestmove is never "0000" under any circumstances,
 //      including if depth 1 aborts before finding any move (extreme time pressure).
 //
 // After each completed iteration:
-//   - Check soft_stop() instead of should_stop() — allows time extensions.
+//   - Check soft_stop() instead of should_stop() -- allows time extensions.
 //   - If the best move changed between iterations, extend soft limit x1.5
 //     (PV instability: the engine is reconsidering, needs more time).
 //   - If the score dropped >= SCORE_DROP_THRESHOLD, extend soft limit x1.25
@@ -1358,6 +1436,11 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 //   Both extensions can apply in the same iteration (multiplicative).
 
 SearchResult Search::go(Board& board) {
+    // Reset all per-search state. Everything that accumulates within a single
+    // go() call (node counters, abort flag, output timestamps, the iteration
+    // depth and root move count, and the easy-move / mate-reduction tracking
+    // used by time management) starts from a clean slate so results from a
+    // previous search cannot leak into this one.
     stats_             = SearchStats{};
     abort_search_      = false;
     last_output_ms_    = 0;
@@ -1392,7 +1475,7 @@ SearchResult Search::go(Board& board) {
     int          last_depth = 0;
 
     // Pre-seed safe_move with the first legal move before the search starts.
-    // Last-resort fallback — guarantees bestmove is never "0000" even if depth 1
+    // Last-resort fallback -- guarantees bestmove is never "0000" even if depth 1
     // aborts instantly (extreme time pressure) and both root_best_move_ and the
     // TT probe fail. Updated to a better move as soon as an iteration completes.
     Move safe_move = MOVE_NONE;
@@ -1408,11 +1491,11 @@ SearchResult Search::go(Board& board) {
         }
     }
 
-    // Forced move: only one legal move exists. No point searching — play it
+    // Forced move: only one legal move exists. No point searching -- play it
     // immediately without spending any time. Every millisecond saved here is
     // banked for future moves where there IS a choice.
     // Emit a minimal info line so GUIs and match runners (fastchess, cutechess)
-    // can extract a score — some crash or warn if bestmove arrives without any
+    // can extract a score -- some crash or warn if bestmove arrives without any
     // preceding info line.
     if (legal_root_count == 1) {
         std::cout << "info depth 0 score cp 0 nodes 0 time 0 pv "
@@ -1442,7 +1525,7 @@ SearchResult Search::go(Board& board) {
         // Aspiration windows: search with a narrow window around the previous
         // iteration's score. Saves nodes when the true score is close to the
         // expected value. On failure, widen the window on the failing side and
-        // re-search. Only applied at depth >= 4 — below that scores are too
+        // re-search. Only applied at depth >= 4 -- below that scores are too
         // unstable to narrow around.
         Score score;
         int aw_fail_highs = 0;  // Count fail-highs for TM extension
@@ -1466,7 +1549,7 @@ SearchResult Search::go(Board& board) {
 
                 if (score <= alpha_asp) {
                     // Fail-low: score is below our window. Widen on the low side only.
-                    // Do NOT modify beta_asp — squeezing the upper bound risks an
+                    // Do NOT modify beta_asp -- squeezing the upper bound risks an
                     // artificial fail-high on re-search (yo-yo effect) when TT and
                     // LMR interactions cause the score to rebound above the narrowed
                     // ceiling. Standard: only ever widen in the failing direction.
@@ -1474,6 +1557,11 @@ SearchResult Search::go(Board& board) {
                     alpha_asp = std::max(score - delta, -SCORE_INFINITE);
                     delta    *= 2;
 
+                    // Format the elapsed time as h:mm:ss,ms for the log line.
+                    // This compact inline block (pure integer arithmetic, no
+                    // allocation) recurs in several info-string sites below;
+                    // it mirrors format_time() in timeman.cpp, which is static
+                    // there and not visible across translation units.
                     char t_now[32];
                     { int64_t ms=TM.elapsed_ms(); int64_t s=(ms/1000)%60,m=(ms/60000)%60,h=ms/3600000,ms3=ms%1000;
                       std::snprintf(t_now,sizeof(t_now),"%lld:%02lld:%02lld,%03lld",(long long)h,(long long)m,(long long)s,(long long)ms3); }
@@ -1502,18 +1590,18 @@ SearchResult Search::go(Board& board) {
                               << " delta " << delta
                               << " [" << t_now << "]\n" << std::flush;
                 } else {
-                    // Score is inside the window — search is complete for this depth.
+                    // Score is inside the window -- search is complete for this depth.
                     break;
                 }
             }
         }
 
         // Discard incomplete results: if aborted mid-iteration the score and
-        // root_best_move_ are unreliable — keep the last fully completed result.
+        // root_best_move_ are unreliable -- keep the last fully completed result.
         // Depth 1 is never discarded since there is no prior fallback.
         if (abort_search_ && depth > 1) break;
 
-        // root_best_move_ is always set from the move loop at ply 0 — we never
+        // root_best_move_ is always set from the move loop at ply 0 -- we never
         // do TT early returns at the root. MOVE_NONE here means the position
         // has no legal moves (mate or stalemate); safe_move is the fallback.
         Move iter_move = root_best_move_;
@@ -1567,7 +1655,7 @@ SearchResult Search::go(Board& board) {
             // all positions the opponent can claim threefold repetition on.
             // We then check after each make_move() whether the resulting hash
             // appears in seen[]. If so, the move leads to a repeated position
-            // and we stop WITHOUT printing it — the engine will not play past
+            // and we stop WITHOUT printing it -- the engine will not play past
             // that point in a real game.
             uint64_t seen[MAX_GAME_HISTORY + MAX_PLY + 2];
             int      seen_count = 0;
@@ -1581,7 +1669,7 @@ SearchResult Search::go(Board& board) {
 
                 // Make the move first, then check for repetition.
                 // Checking before make_move() would test the position we're
-                // leaving, not the one we're entering — wrong in both directions.
+                // leaving, not the one we're entering -- wrong in both directions.
                 pv_board.make_move(pv_move);
 
                 bool repeated = false;
@@ -1644,7 +1732,7 @@ SearchResult Search::go(Board& board) {
 
 #ifdef FACON_DEBUG
         // Diagnostic stats for this iteration. Counters are cumulative across
-        // all iterations — shows the running total, not per-iteration delta.
+        // all iterations -- shows the running total, not per-iteration delta.
         std::cout << "info string ST: depth " << depth
                   << " lmr " << stats_.lmr_attempted
                   << "/" << stats_.lmr_re_searched
@@ -1690,7 +1778,7 @@ SearchResult Search::go(Board& board) {
         }
 
         // AW fail-high extension: if the aspiration window failed high one or
-        // more times this iteration, the position is tactically volatile — the
+        // more times this iteration, the position is tactically volatile -- the
         // engine found something better than expected and needs time to resolve
         // the window correctly. The extension is proportional to the number of
         // fail-highs: x1.10 per fail-high, capped at x1.50.

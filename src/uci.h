@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-14 23:15
+// Last modified: 2026-05-27 15:23
 // uci.h -- Universal Chess Interface protocol handler
 //
 // Reads commands from stdin line by line and dispatches them to the engine.
@@ -39,6 +39,16 @@
 //     handler. Used by main.cpp to support invoking the benchmark from the
 //     command line (./facon-1.5 bench). Accepts the same argument string as
 //     the UCI "bench" command ("verbose", "depth N", or both).
+//
+// Facon 1.6 -- Temple
+//   - "trace" command added: dumps the per-position coefficient vector
+//     produced by trace_evaluate() (see eval.h). Includes a built-in
+//     fidelity check that verifies the trace reconstructs evaluate() to
+//     the bit before printing. Intended for inspection by humans and as
+//     a ground truth for external tooling that consumes coefficient
+//     vectors. Not part of the UCI spec.
+//   - Comment audit pass: non-ASCII punctuation in comments replaced with
+//     ASCII equivalents for portability. No functional changes.
 // =============================================================================
 
 #pragma once
@@ -64,7 +74,7 @@ public:
     void run_bench(const std::string& args);
 
 private:
-    // The current board position — updated by "position" commands
+    // The current board position -- updated by "position" commands
     Board board_;
 
     // Thread running the current search. Launched by cmd_go(), joined by
@@ -77,13 +87,13 @@ private:
     // COMMAND HANDLERS
     // -------------------------------------------------------------------------
 
-    // "uci" — print engine identity and supported options, then "uciok"
+    // "uci" -- print engine identity and supported options, then "uciok"
     void cmd_uci();
 
-    // "isready" — respond with "readyok" once all initialization is complete
+    // "isready" -- respond with "readyok" once all initialization is complete
     void cmd_isready();
 
-    // "ucinewgame" — clear state from the previous game
+    // "ucinewgame" -- clear state from the previous game
     void cmd_ucinewgame();
 
     // "position startpos [moves ...]"
@@ -94,13 +104,13 @@ private:
     //     [movestogo X] [infinite]"
     void cmd_go(std::istringstream& ss);
 
-    // "stop" — abort the current search immediately
+    // "stop" -- abort the current search immediately
     void cmd_stop();
 
-    // "setoption name <name> value <value>" — apply a configuration change
+    // "setoption name <name> value <value>" -- apply a configuration change
     void cmd_setoption(std::istringstream& ss);
 
-    // "d" — display the current board (debug command, not part of UCI spec)
+    // "d" -- display the current board (debug command, not part of UCI spec)
     void cmd_display();
 
     // "eval" -- print a per-component breakdown of the static evaluation of
@@ -109,13 +119,21 @@ private:
     // contributions so the user can diagnose evaluation changes.
     void cmd_eval();
 
-    // "perft N" / "perft divide N" — count leaf nodes to depth N.
+    // "trace" -- print the coefficient vector that trace_evaluate() produces
+    // for the current position (debug command, not part of UCI spec). Used
+    // to inspect and validate the per-feature coefficient extraction that
+    // external evaluation tooling consumes. The command also runs the
+    // built-in fidelity check (evaluate() == score_from_trace()) and
+    // reports the result; any mismatch indicates a bug in trace_evaluate.
+    void cmd_trace();
+
+    // "perft N" / "perft divide N" -- count leaf nodes to depth N.
     // Not part of the UCI spec. Used to verify move generator correctness.
     // "perft N" prints total nodes and elapsed time.
     // "perft divide N" also prints the node count per first legal move.
     void cmd_perft(std::istringstream& ss);
 
-    // "bench" / "bench depth N" — search a fixed set of 10 positions at
+    // "bench" / "bench depth N" -- search a fixed set of 10 positions at
     // depth N (default 18) and report total nodes, time, and NPS.
     // Not part of the UCI spec. Used to measure optimization impact.
     // Deterministic: same depth always produces the same node count.

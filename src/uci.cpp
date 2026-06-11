@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-14 23:15
+// Last modified: 2026-05-27 15:23
 // uci.cpp -- UCI protocol implementation
 //
 // Facon 1.0 -- Oxido
@@ -62,6 +62,17 @@
 //     [verbose] [depth N]) without entering the UCI loop. Pure wrapper:
 //     constructs an istringstream from the argument string and calls
 //     cmd_bench() directly. No change to bench behaviour or output.
+//
+// Facon 1.6 -- Temple
+//   - cmd_trace(): new debug command "trace" that calls trace_evaluate()
+//     on the current position and prints the resulting coefficient vector
+//     plus the additional_score scalar. Includes a built-in fidelity check
+//     comparing evaluate() to the score reconstructed from the trace; any
+//     mismatch is flagged in the output. Intended for inspection of the
+//     coefficient layout that external evaluation tooling consumes. Not
+//     part of the UCI spec; not in the search hot path.
+//   - Comment audit pass: non-ASCII punctuation in comments replaced with
+//     ASCII equivalents for portability. No functional changes.
 // =============================================================================
 
 #include "version.h"
@@ -123,7 +134,7 @@ void UCI::cmd_uci() {
 // =============================================================================
 
 void UCI::cmd_isready() {
-    // All initialization happens at startup — we are always ready here
+    // All initialization happens at startup -- we are always ready here
     std::cout << "readyok\n" << std::flush;
 }
 
@@ -271,7 +282,7 @@ void UCI::cmd_setoption(std::istringstream& ss) {
 }
 
 // =============================================================================
-// COMMAND: d (display — not part of UCI spec, used for debugging)
+// COMMAND: d (display -- not part of UCI spec, used for debugging)
 // =============================================================================
 
 void UCI::cmd_display() {
@@ -292,6 +303,62 @@ void UCI::cmd_display() {
 
 void UCI::cmd_eval() {
     evaluate_verbose(board_);
+}
+
+// =============================================================================
+// COMMAND: trace (not part of UCI spec, used for tuning-vector inspection)
+// =============================================================================
+// Syntax: trace
+//
+// Dumps the coefficient vector that trace_evaluate() produces for the
+// current position, plus the additional-score scalar and the phase weight.
+// Format: human-readable, grouped by feature, with non-zero coefficients
+// only (the vector is large but sparse for any given position).
+//
+// Before printing, runs a fidelity check that compares the engine's
+// evaluate() value with the score reconstructed from the trace under the
+// live eval_weights[]. Any divergence is flagged at the top of the output
+// and indicates a bug in trace_evaluate() that must be fixed before the
+// trace can be trusted by external tooling.
+
+void UCI::cmd_trace() {
+    EvalTrace trace;
+    trace_evaluate(board_, trace);
+
+    Score engine_score = evaluate(board_);
+    Score trace_score  = score_from_trace(trace, eval_weights, board_.side_to_move);
+
+    std::cout << "=== trace ===\n";
+    std::cout << "phase_mg         : " << trace.phase_mg << " /256\n";
+    std::cout << "additional_score : " << trace.additional_score
+              << " cp  (material + king safety + mopup, from White's POV)\n";
+    std::cout << "engine evaluate(): " << engine_score
+              << " cp  (from side-to-move's POV)\n";
+    std::cout << "trace recons.    : " << trace_score
+              << " cp  (from side-to-move's POV)\n";
+    if (engine_score == trace_score) {
+        std::cout << "fidelity         : OK (engine == trace)\n";
+    } else {
+        std::cout << "fidelity         : *** MISMATCH ***  delta = "
+                  << (engine_score - trace_score)
+                  << " cp -- trace_evaluate() has a bug\n";
+    }
+    std::cout << "\n";
+
+    // Print the non-zero coefficients grouped by feature. Each line is:
+    //   group_name [absolute_index]: coefficient
+    // We walk all NUM_WEIGHTS slots, skip zeros, and let the indices speak
+    // for themselves (the group enum in eval.h is the authoritative key).
+    std::cout << "non-zero coefficients (idx: count):\n";
+    int nonzero = 0;
+    for (int i = 0; i < NUM_WEIGHTS; i++) {
+        if (trace.coefficients[i] != 0) {
+            std::cout << "  [" << i << "] = " << trace.coefficients[i] << "\n";
+            nonzero++;
+        }
+    }
+    std::cout << "(" << nonzero << " non-zero out of " << NUM_WEIGHTS << ")\n";
+    std::cout.flush();
 }
 
 // =============================================================================
@@ -345,7 +412,7 @@ void UCI::cmd_perft(std::istringstream& ss) {
         divide = true;
         if (!(ss >> depth)) { std::cout << "perft divide: missing depth\n" << std::flush; return; }
     } else {
-        // Parse manually — exceptions are disabled in release builds (-fno-exceptions)
+        // Parse manually -- exceptions are disabled in release builds (-fno-exceptions)
         bool valid = !token.empty();
         for (char c : token) if (c < '0' || c > '9') { valid = false; break; }
         if (!valid) { std::cout << "perft: invalid depth\n" << std::flush; return; }
@@ -358,7 +425,7 @@ void UCI::cmd_perft(std::istringstream& ss) {
         return;
     }
 
-    // Operate on a copy — the current position is not affected
+    // Operate on a copy -- the current position is not affected
     Board board = board_;
 
     auto t0 = std::chrono::steady_clock::now();
@@ -611,6 +678,7 @@ void UCI::loop() {
         else if (token == "setoption")  cmd_setoption(ss);
         else if (token == "d")          cmd_display();
         else if (token == "eval")       cmd_eval();
+        else if (token == "trace")      cmd_trace();
         else if (token == "perft")      cmd_perft(ss);
         else if (token == "bench")      cmd_bench(ss);
         else if (token == "quit") {

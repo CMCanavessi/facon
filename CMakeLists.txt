@@ -1,5 +1,5 @@
 # =============================================================================
-# Last modified: 2026-05-14 11:57
+# Last modified: 2026-06-06 19:27
 # CMakeLists.txt -- Build system for the Facon chess engine
 #
 # Facon 1.0 -- Oxido
@@ -46,6 +46,9 @@
 #     general-purpose register in the hot search/eval paths. Measured
 #     ~+2.3% NPS over the previous default flag set on Ryzen 7 1700.
 #
+# Facon 1.6 -- Temple
+#   - Version bumped to 1.6. Codename "Temple".
+#
 # QUICK START
 # -----------
 # Linux (portable binary):
@@ -75,13 +78,26 @@ cmake_minimum_required(VERSION 3.16)
 # =============================================================================
 # VERSION -- CHANGE THESE TWO LINES FOR EACH RELEASE
 # =============================================================================
-# During development: FACON_CODENAME = "dev-NN" (e.g. "dev-01", "dev-rc1")
-#   binary name = facon-1.5-dev-01,  UCI id = "Facon 1.5-dev-01"
-# For release:        FACON_CODENAME = "Espiga"
-#   binary name = facon-1.5,         UCI id = "Facon 1.5 - Espiga"
+# Set PROJECT_VERSION (in project() below) and FACON_CODENAME to taste.
+#
+# During development, use a codename starting with "dev". The version string
+# and binary name then carry that suffix, keeping dev builds distinguishable:
+#     FACON_CODENAME = "dev-..."
+#       version string = "<version>-<codename>"   (e.g. used in the UCI id)
+#       binary name    = "facon-<version>-<codename>"
+#
+# For a release, use the plain release codename (anything not starting with
+# "dev"). The suffix is dropped from the binary and the version string switches
+# to the release format:
+#     FACON_CODENAME = "<codename>"
+#       version string = "<version> - <codename>"
+#       binary name    = "facon-<version>"
+#
+# The rule below ("^dev") is what selects between the two formats, so no other
+# line needs editing when moving between development and release.
 
-project(facon VERSION 1.5 LANGUAGES CXX)
-set(FACON_CODENAME "Espiga")
+project(facon VERSION 1.6 LANGUAGES CXX)
+set(FACON_CODENAME "Temple")
 
 # =============================================================================
 # VERSION STRING CONSTRUCTION
@@ -98,7 +114,7 @@ endif()
 message(STATUS "Version string : ${FACON_VERSION_STRING}")
 message(STATUS "Output name    : ${FACON_OUTPUT_NAME}")
 
-# Generate version.h from version.h.in — included by main.cpp and uci.cpp.
+# Generate version.h from version.h.in -- included by main.cpp and uci.cpp.
 # Never edit the generated version.h directly; edit CMakeLists.txt instead.
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
@@ -207,7 +223,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 
     # --- CPU target ---
     # POPCNT is a hard requirement: we use popcount() in every bitboard loop.
-    # Without it the compiler emulates it in software — significant slowdown.
+    # Without it the compiler emulates it in software -- significant slowdown.
     # -mpopcnt is supported by all x86-64 CPUs made after ~2008.
     if(NATIVE)
         message(STATUS "CPU target: native (not distributable)")

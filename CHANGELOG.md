@@ -1,7 +1,50 @@
 # Changelog
-<!-- Last modified: 2026-05-26 08:07 -->
+<!-- Last modified: 2026-06-11 18:05 -->
 
 All notable changes to Facon will be documented here.
+
+---
+
+## [1.6] "Temple" -- 2026-06-11
+
+**Ordo ~2800, +250 Elo over 1.5.** Self-play vs 1.5: +222.8 Elo (n=10000, +/- 7.0) at 10+0.1. Gauntlet 4 (high-Ordo field): 677.0/1040 (65.1%, Ordo ~2800). The gain is broad rather than concentrated: 1.6 centralizes every evaluation weight into a single tunable vector, tunes it with Texel tuning, makes the piece-square tables phase-tapered, and adds three new evaluation feature groups.
+
+### Evaluation -- Tuning and Tapering
+
+- **Weight centralization** (`eval.cpp`, `eval.h`): every tunable evaluation weight is collected into a single flat array `eval_weights[NUM_WEIGHTS]` (934 entries), organized into named groups by `constexpr int` offsets. Previously weights were scattered as named compile-time constants across the file. The array is deliberately non-const so it can be mutated by the tuner; the eval hot path treats it as read-only by convention.
+- **Texel-tuned weight set** (`eval.cpp`): the integrated weights were produced by Texel tuning on a labeled quiet-position dataset. Material was modeled as a separate tunable during tuning and folded back into the PSTs afterward, so `PIECE_VALUE` stays fixed at 100/320/330/500/900 while the evaluation reproduces the tuned values. First change of the 1.6 cycle to intentionally alter playing strength.
+- **Tapered piece-square tables** (`eval.cpp`, `eval.h`): each PST square now holds separate middlegame and endgame values (64 squares x 2 phases = 128 entries per group), blended by `game_phase()`. Previously the PSTs were single-valued. Lets the tuner express phase-dependent placement (e.g. king centralization bad in the middlegame, good in the endgame).
+- **Weight-group offsets converted from `enum` to `constexpr int`** (`eval.h`): the group-base and per-group offsets were scoped enums; because they are summed in index arithmetic and were different enum types, C++20 flagged the additions as deprecated (`-Wdeprecated-enum-enum-conversion`). Plain integer constants remove the warning and generate identical code.
+
+### Evaluation -- New Feature Groups
+
+- **Pawn shelter / storm** (`eval.cpp`, `eval.h`): new tunable group (`SHELTER_STORM`, 32 slots at offset 868). Shelter scores the friendly pawn nearest the king on the king's file and the two adjacent files, bucketed by rank gap into {1, 2, 3, 4+} (no pawn maps to the worst bucket). Storm scores enemy pawns advancing on those same files, bucketed by advancement. Both tapered.
+- **Second king-safety layer** (`eval.cpp`, `eval.h`): new tunable group (`KING_SAFETY_V2`, 16 slots at offset 900), complementing the attacker-count-based `KING_SAFETY`. Scores open/semi-open files toward the king (king's file weighted apart from adjacent files) and safe checks (squares an enemy can check from without being captured, per piece type). Tapered.
+- **Tempo** (`eval.cpp`, `eval.h`): bonus for the side to move, added in the new `POSITIONAL2` group (offset 916). Added per the side to move (not per colour), so it breaks White-minus-Black symmetry; added once with the correct sign. **+19 Elo (n=860, LOS 98.5%)** -- the single most valuable feature added in 1.6.
+- **Bishop outpost** (`eval.cpp`, `eval.h`): mirrors the knight outpost geometry. A bishop on relative ranks 4-6 on a square no enemy pawn can attack (now or in the future) gets a bonus, larger when supported by a friendly pawn. Bitboard masks/shifts, no per-square loops. **+6.6 Elo (n=3480, LOS 93%).**
+- **Passed-pawn refinement** (`eval.cpp`, `eval.h`): four refinements per passed pawn beyond the rank-scaled bonus -- king proximity (own king near is good, enemy king near is bad, endgame-weighted), blockade (enemy piece on the stop square; a minor blockades more effectively than a major), free path (clear run to promotion), and protection (defended by a friendly pawn). All computed in a single pass over passed pawns using masks/fills, no NPS cost. **+10.6 Elo over the tempo+outpost base (n=6520, LOS 99.94%)**; king proximity alone was +5.9 (n=2420), the other three added ~+5 more.
+
+### Evaluation -- Trace and Consistency
+
+- **`trace_evaluate()` and the `trace` command** (`eval.cpp`, `eval.h`, `uci.cpp`): `trace_evaluate()` produces the linear coefficient decomposition of the evaluation, required for Texel tuning; its dot product with `eval_weights[]` reproduces `evaluate()` within the documented tapered-blend rounding tolerance (<=2cp). The `positional2_counts()` helper is the single source of truth shared by the scoring path and the trace path. A new `trace` UCI debug command prints the per-weight coefficients and the engine-vs-trace fidelity check.
+
+### Infrastructure
+
+- **Hardcoded magic numbers** (`bitboard.cpp`): the bishop/rook magic numbers, previously found at startup by a fixed-seed randomized search, are now baked in as constants (`BISHOP_MAGIC_HARDCODED[64]`, `ROOK_MAGIC_HARDCODED[64]`). `init_magic()` uses them directly, so startup only fills the attack tables. Startup time dropped from ~261 ms to ~11 ms (~96% faster) on the Ryzen 7 1700. Attacks are bit-identical (bench unchanged at 618952, depth 8). The randomized search is preserved under `#ifdef FACON_REGENERATE_MAGICS` for offline regeneration if the masks change; not compiled into the normal build.
+
+### Build
+
+- **Version bumped to 1.6, codename "Temple"** (`CMakeLists.txt`): the version-string and binary-name logic distinguishes development codenames (starting with `dev`, which carry the codename as a suffix) from release codenames (no suffix). The version-selection comments were generalized so they need no editing between development and release.
+
+### Features Attempted and Rejected
+
+- **Rook behind passed pawn (Tarrasch rule)**: -9 Elo (n=3020, LOS 2.9%). Conceptually sound but redundant with the rook PST and existing passed-pawn terms.
+- **Non-linear mobility (per-count tables)**: -12 Elo (n=5300). Overfit -- tuned per-count values tracked dataset noise; the linear mobility from 1.4 is more robust at this strength.
+- **Material imbalance (Kaufman-style: knight/rook/bishop-pair scaled by pawn count)**: approximately neutral to -5 Elo. The tuning itself signaled redundancy (two of three terms wrong-signed vs theory, tiny magnitudes, error barely moved, and the optimizer redistributed existing PST/bishop-pair value rather than adding signal); self-play confirmed it. Redundant with the tuned PSTs and the existing bishop-pair term.
+
+### Known Limitations
+
+- **Drawn pawnless endings evaluated as material** (carried from 1.5): K+B vs K, K+N vs K, K+N+N vs K, K+B+B same-color vs K return raw material rather than 0. Proper resolution requires material-signature endgame recognition or tablebase probing.
 
 ---
 
