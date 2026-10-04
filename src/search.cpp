@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-29 10:23
+// Last modified: 2026-07-20 09:30
 // search.cpp -- Negamax alpha-beta search with iterative deepening
 //
 // Facon 1.1 -- Herrumbre
@@ -411,6 +411,50 @@
 //     "--" so every byte reaching a terminal or an editor is portable.
 //     No code paths were altered by this pass; only the SEE guard above
 //     changes behavior.
+//
+// Facon 1.7 -- Filo
+//   - The iterative-deepening cap is enforced against MAX_PLY - 1 in both
+//     branches (with and without a "go depth" limit). Previously an
+//     unclamped "go depth" beyond MAX_PLY drove LMR_table[depth] past the
+//     end of the table -- an out-of-bounds read yielding garbage
+//     reductions -- and the default branch could index LMR_table[MAX_PLY]
+//     at the (practically unreachable) last iteration. cmd_go() clamps and
+//     reports; the min() here is defense in depth.
+//   - History heuristic upgraded to two-sided gravity: bonus for the quiet
+//     that produced the cutoff, symmetric malus for the quiets searched
+//     before it at the same node (tracked per node, capped at
+//     QUIETS_TRIED_CAP). Ordering band preserved via the
+//     HISTORY_MAX/2 + entry/2 mapping in move_score(). Changes move
+//     ordering and therefore the bench signature.
+//   - Continuation history (1-ply): conthist_[prev_piece][prev_to][piece]
+//     [to], updated with the same two-sided gravity as the butterfly at the
+//     same cutoff site, combined 1:1 in move_score() (sum compressed into
+//     the unchanged [0, HISTORY_MAX] band via /4). The row for the node's
+//     previous move is computed once per node next to the countermove
+//     lookup and threaded through sort_moves()/move_score(). Cleared per
+//     game in new_game() (see the per-game reset section). Changes move
+//     ordering and therefore the bench signature.
+//   - Static-eval pipeline + improving: the static evaluation is computed
+//     at every non-check node (sourced from the TT when stored there,
+//     refined by usable TT score bounds), pushed to eval_stack_[ply],
+//     stored back with every TT entry, and compared against the eval two
+//     plies up to derive `improving`. Consumers: the RFP margin shrinks
+//     when improving, the move-level futility margin grows, and the LMP
+//     threshold tightens to two thirds when not improving. Changes the
+//     bench signature.
+//   - Singular extensions: at depth >= SE_MIN_DEPTH with a deep-enough,
+//     non-UPPER TT entry, the node re-searches itself with the TT move
+//     excluded (excluded_[ply]) at (depth-1)/2 against a null window
+//     SE_MARGIN * depth below the TT score; a fail-low proves the TT move
+//     singular and it searches one ply deeper. The verification skips the
+//     TT cutoff, is barred from storing, and hides the excluded move from
+//     the legal count. Changes the bench signature.
+//   - ProbCut: after NMP, non-PV nodes at depth >= PC_MIN_DEPTH try their
+//     SEE-safe captures at (depth - 4) against (pcbeta - 1, pcbeta) with
+//     pcbeta = beta + PC_MARGIN; the first to reach pcbeta returns its
+//     score, stored at depth - 3 as a LOWER bound (under the exclusion
+//     guard, like every store here). Eval-gated and TT-vetoed so hopeless
+//     nodes never pay for it. Changes the bench signature.
 // =============================================================================
 
 #include "search.h"
@@ -626,8 +670,16 @@ constexpr int ORDER_TT_MOVE = 1000000;  // Always search TT move first
 // ORDER_CAPTURE_GOOD/BAD are class-scope constants in search.h.
 constexpr int ORDER_KILLER1 =   90000;  // Most recent killer for this ply
 constexpr int ORDER_KILLER2 =   80000;  // Second killer for this ply
-// Quiet moves: scored by history_[color][from][to], range [0, HISTORY_MAX=50000].
-// This sits below ORDER_KILLER2 so killers always outrank history-scored quiets.
+// Quiet moves: two-sided history entries live in [-HISTORY_MAX, HISTORY_MAX];
+// move_score() maps them into the same [0, HISTORY_MAX] band as before
+// (HISTORY_MAX/2 + entry/2), so killers and countermove still outrank every
+// quiet and bad captures (-100000 base) still sit below.
+
+// How many searched-but-failed quiets negamax remembers per node for the
+// history malus. Past the first 64 the ordering signal no longer
+// distinguishes anything, and the cap bounds the per-frame stack cost
+// (256 bytes here; ~64 KB across a maximum-length line).
+constexpr int QUIETS_TRIED_CAP = 64;
 
 // Score drop threshold for dynamic time extension.
 // If the best score drops by this many centipawns between iterations, the
@@ -635,7 +687,8 @@ constexpr int ORDER_KILLER2 =   80000;  // Second killer for this ply
 constexpr int SCORE_DROP_THRESHOLD = 30;
 
 int Search::move_score(const Board& board, Move m,
-                        Move tt_move, Move countermove, int ply) const {
+                        Move tt_move, Move countermove,
+                        int (*ch_row)[64], int ply) const {
     if (m == tt_move) return ORDER_TT_MOVE;
 
     Square to     = to_sq(m);
@@ -682,21 +735,32 @@ int Search::move_score(const Board& board, Move m,
     // move (not MOVE_NONE), so this branch correctly falls through.
     if (m == countermove) return ORDER_COUNTERMOVE;
 
-    // History heuristic: quiet moves are ordered by their accumulated bonus.
-    // Moves that have caused beta cutoffs in previous searches of similar
-    // positions are scored higher and searched earlier.
+    // History heuristic: quiet moves are ordered by their combined two-sided
+    // histories -- the butterfly (from->to in general) plus the continuation
+    // history for this node's previous move (this reply in this context),
+    // weighted 1:1. Each lives in [-HISTORY_MAX, HISTORY_MAX], so the sum
+    // lives in [-2*HISTORY_MAX, 2*HISTORY_MAX] and the /4 compresses it into
+    // the same [0, HISTORY_MAX] ordering band the tier layout always assumed
+    // -- killers and countermove stay above, bad captures stay below. With a
+    // null row (root, after a null move) the butterfly alone is compressed a
+    // little tighter; relative order among quiets is unaffected.
     Color us = board.side_to_move;
-    return history_[us][from_sq(m)][to_sq(m)];
+    int   h  = history_[us][from_sq(m)][to_sq(m)];
+    if (ch_row != nullptr)
+        h += ch_row[board.piece_at(from_sq(m))][to_sq(m)];
+    return HISTORY_MAX / 2 + h / 4;
 }
 
 void Search::sort_moves(const Board& board, MoveList& moves,
-                         int start, Move tt_move, Move countermove, int ply) const {
+                         int start, Move tt_move, Move countermove,
+                         int (*ch_row)[64], int ply) const {
     // Score all moves once into a parallel array, then selection-sort
     // using the precomputed scores. Previously move_score() was called
     // per comparison (O(n^2) calls); now it is called once per move (O(n)).
     int scores[MAX_MOVES];
     for (int i = start; i < moves.count; i++)
-        scores[i] = move_score(board, moves.moves[i], tt_move, countermove, ply);
+        scores[i] = move_score(board, moves.moves[i], tt_move, countermove,
+                               ch_row, ply);
 
     // Selection sort: find the highest-scored move and swap it to position i.
     // O(n^2) comparisons but only O(n) score computations. Fast enough for
@@ -769,7 +833,7 @@ Score Search::quiescence(Board& board, Score alpha, Score beta, int ply) {
     // Killers are irrelevant in quiescence (captures only) -- pass ply anyway
     // for interface consistency but killer slots will never match captures.
     // Countermove is also irrelevant (captures use MVV-LVA), so pass MOVE_NONE.
-    sort_moves(board, captures, 0, MOVE_NONE, MOVE_NONE, ply);
+    sort_moves(board, captures, 0, MOVE_NONE, MOVE_NONE, nullptr, ply);
 
     for (int i = 0; i < captures.count; i++) {
         Move m = captures.moves[i];
@@ -927,7 +991,7 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
 
     if (tt_hit) {
         stats_.tt_hits++;
-        tt_move = tt_entry.move;
+        tt_move = tt_entry.best_move();
 
         // Guard against hash collisions producing garbage moves.
         // A collided entry can have a move that is completely invalid in this
@@ -948,7 +1012,8 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         // so that root_best_move_ is set from the actual move loop, never from
         // a potentially stale or hash-collided TT entry. The TT move is still
         // used for move ordering (tt_move is passed to sort_moves below).
-        if (tt_entry.depth >= depth && ply > 0) {
+        if (tt_entry.depth >= depth && ply > 0
+            && excluded_[ply] == MOVE_NONE) {
             Score     tt_score = score_from_tt(tt_entry.score, ply);
             BoundType tt_bound = bound_of(tt_entry.gen_bound);
 
@@ -998,16 +1063,57 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     }
 
     // -------------------------------------------------------------------------
-    // STATIC EVALUATION (for pruning decisions)
+    // STATIC EVALUATION (always, with the TT as cache and refiner)
     // -------------------------------------------------------------------------
-    // Computed once per node and reused by reverse futility pruning and
-    // move-level futility pruning. Only needed when not in check AND at
-    // shallow depths where pruning applies. At depth 4+ neither RFP nor
-    // move-level futility fires, so calling evaluate() would be wasted work.
+    // Every non-check node has a static evaluation now -- not just the
+    // shallow ones where pruning fires. Three sources, in order:
+    //
+    //   1. The TT entry's eval field, when this position was stored before:
+    //      a plain cache, one evaluate() saved on every such hit.
+    //   2. evaluate(board) otherwise.
+    //   3. Refinement: a usable TT *score* bound tightens the eval -- a
+    //      LOWER bound above it raises it, an UPPER bound below it lowers
+    //      it. The search knew better than the bare eval; use that.
+    //
+    // The result feeds RFP / razoring / futility as before, goes to
+    // eval_stack_[ply] for the improving flag, and is stored back with
+    // this node's TT entry so future visits skip the evaluate() call. In
+    // check there is no meaningful static eval: EVAL_NONE is recorded.
     Score static_eval = 0;
-    bool can_prune = !in_check && ply > 0
-                  && depth <= std::max(RFP_MAX_DEPTH, FUTILITY_MAX_DEPTH);
-    if (can_prune) static_eval = evaluate(board);
+    bool  can_prune   = !in_check && ply > 0;
+    if (!in_check) {
+        if (tt_hit && tt_entry.eval != EVAL_NONE)
+            static_eval = Score(tt_entry.eval);
+        else
+            static_eval = evaluate(board);
+
+        if (tt_hit) {
+            BoundType tb = bound_of(tt_entry.gen_bound);
+            Score     ts = score_from_tt(tt_entry.score, ply);
+            if (   (tb == BOUND_LOWER && ts > static_eval)
+                || (tb == BOUND_UPPER && ts < static_eval))
+                static_eval = ts;
+        }
+        eval_stack_[ply] = static_eval;
+    } else {
+        eval_stack_[ply] = Score(EVAL_NONE);
+    }
+
+    // What this node's TT entry will carry as its eval (the raw evaluation
+    // channel, never the refined-or-searched score -- score already has its
+    // own field).
+    const Score stored_eval = in_check ? Score(EVAL_NONE)
+                                       : (tt_hit && tt_entry.eval != EVAL_NONE)
+                                           ? Score(tt_entry.eval)
+                                           : static_eval;
+
+    // Improving: our position has been getting better since our previous
+    // move (two plies up). Conservative default when either node was in
+    // check. Modulates RFP, move-level futility and LMP below.
+    bool improving = !in_check
+                  && ply >= 2
+                  && eval_stack_[ply - 2] != Score(EVAL_NONE)
+                  && static_eval > eval_stack_[ply - 2];
 
     // -------------------------------------------------------------------------
     // REVERSE FUTILITY PRUNING (RFP) / Static Null Move Pruning
@@ -1020,7 +1126,8 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // Guards: not in check, not at root, shallow depth (1-3).
     // Margin: 100cp per depth level (d1=100, d2=200, d3=300).
     if (can_prune && depth <= RFP_MAX_DEPTH
-        && static_eval - RFP_MARGIN * depth >= beta)
+        && static_eval - (RFP_MARGIN * depth
+                          - (improving ? RFP_IMPROVING_BONUS : 0)) >= beta)
     {
         return static_eval;
     }
@@ -1118,6 +1225,65 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     }
 
     // -------------------------------------------------------------------------
+    // PROBCUT
+    // -------------------------------------------------------------------------
+    // The capture-side mirror of null-move pruning: if a SHALLOW search of
+    // a sound capture already beats beta by a solid margin (pcbeta), the
+    // full-depth search will almost surely fail high too -- cut now and
+    // return the bound. Unblocked by the static-eval channel: the eval
+    // gate costs nothing and keeps the attempt to nodes plausibly failing
+    // high; the TT veto skips it when a deep-enough entry already answered
+    // that we sit below the target. Candidates are SEE-safe captures only,
+    // ordered by the same MVV-LVA machinery quiescence uses; the first one
+    // whose reduced search reaches pcbeta returns immediately. The cutoff
+    // is stored at depth - 3 (worth more than the reduced search, less
+    // than the full one) under the exclusion guard, like every store in
+    // this function; the excluded move itself is invisible here too.
+    if (   can_prune
+        && !is_pv
+        && depth >= PC_MIN_DEPTH
+        && !is_mate_score(beta))
+    {
+        Score pcbeta = beta + PC_MARGIN;
+        if (   static_eval + PC_EVAL_GATE >= beta
+            && !(tt_hit
+                 && tt_entry.depth >= depth - 3
+                 && score_from_tt(tt_entry.score, ply) < pcbeta))
+        {
+            int pc_depth = depth - 4;
+
+            MoveList pc_caps;
+            generate_captures(board, pc_caps);
+            sort_moves(board, pc_caps, 0, MOVE_NONE, MOVE_NONE, nullptr, ply);
+
+            for (int pi = 0; pi < pc_caps.count; pi++) {
+                Move pm = pc_caps.moves[pi];
+                if (pm == excluded_[ply])
+                    continue;
+                if (see(board, pm) < 0)
+                    continue;
+
+                board.make_move(pm);
+                if (board.is_attacked(board.king_square(~board.side_to_move),
+                                      board.side_to_move)) {
+                    board.unmake_move(pm);
+                    continue;
+                }
+                Score s = -negamax(board, -pcbeta, -pcbeta + 1, pc_depth,
+                                   ply + 1, true, pm);
+                board.unmake_move(pm);
+
+                if (s >= pcbeta) {
+                    if (excluded_[ply] == MOVE_NONE)
+                        TT.store(board.hash, pm, s, stored_eval,
+                                 depth - 3, BOUND_LOWER, ply);
+                    return s;
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // MOVE SEARCH
     // -------------------------------------------------------------------------
     // Look up the countermove for the opponent's previous move (prev_move),
@@ -1128,21 +1294,88 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // When prev_move is MOVE_NONE (root, or after a null move) there is no
     // refutation to look up; countermove stays MOVE_NONE and the ordering
     // tier is silently skipped in move_score().
-    Move countermove = MOVE_NONE;
-    if (prev_move != MOVE_NONE) {
-        Piece prev_piece = board.piece_at(to_sq(prev_move));
-        countermove      = countermoves_[prev_piece][to_sq(prev_move)];
+    // -------------------------------------------------------------------------
+    // SINGULAR EXTENSIONS
+    // -------------------------------------------------------------------------
+    // When the TT already knows this node's best move to serious depth with
+    // a usable bound, ask the singular question: is it the ONLY good move?
+    // Verify by re-searching THIS node with that move excluded, at reduced
+    // depth, against a null window just below the TT score. If everything
+    // else fails low, the TT move is singular and earns one extra ply --
+    // depth concentrated exactly where the tree is actually decided.
+    //
+    // The verification is a re-search of this same node (same ply, same
+    // board, same side to move -- note the call is NOT negated), running
+    // under excluded_[ply]: the TT cutoff is skipped (it would answer with
+    // the very entry being questioned), nothing is stored (a world without
+    // the best move must not pollute the real entry), and the move loop
+    // hides the excluded move before counting legals -- so an only-move
+    // fails the verification by mate/stalemate score and is correctly
+    // singular. It otherwise runs under the node's normal machinery,
+    // including the TT-cached eval, which is a property of the position
+    // and remains valid here. Placed after all early-return pruning so a
+    // node that RFP/razoring/NMP resolves never pays for a verification.
+    int singular_ext = 0;
+    if (   ply > 0
+        && depth >= SE_MIN_DEPTH
+        && excluded_[ply] == MOVE_NONE
+        && tt_hit
+        && tt_move != MOVE_NONE
+        && tt_entry.depth >= depth - 3
+        && bound_of(tt_entry.gen_bound) != BOUND_UPPER)
+    {
+        Score se_tt_score = score_from_tt(tt_entry.score, ply);
+        if (!is_mate_score(se_tt_score)) {
+            Score sbeta  = se_tt_score - SE_MARGIN * depth;
+            int   sdepth = (depth - 1) / 2;
+
+            excluded_[ply] = tt_move;
+            Score s = negamax(board, sbeta - 1, sbeta, sdepth,
+                              ply, do_null, prev_move);
+            excluded_[ply] = MOVE_NONE;
+
+            if (s < sbeta)
+                singular_ext = 1;
+        }
     }
 
-    sort_moves(board, moves, 0, tt_move, countermove, ply);
+    Move countermove = MOVE_NONE;
+    // Continuation-history row for this node: conthist_[prev_piece][prev_to],
+    // computed once here (same pattern as the countermove lookup) and passed
+    // down so move_score() indexes it directly. Null at the root and after a
+    // null move -- no previous move to condition on. The same row is reused
+    // by the cutoff update below.
+    int (*ch_row)[64] = nullptr;
+    if (prev_move != MOVE_NONE) {
+        Piece  prev_piece = board.piece_at(to_sq(prev_move));
+        Square prev_to    = to_sq(prev_move);
+        countermove       = countermoves_[prev_piece][prev_to];
+        ch_row            = conthist_[prev_piece][prev_to];
+    }
+
+    sort_moves(board, moves, 0, tt_move, countermove, ch_row, ply);
 
     int   legal_count = 0;
     Move  best_move   = MOVE_NONE;
     Score best_score  = -SCORE_INFINITE;
     Score orig_alpha  = alpha;
 
+    // Quiet moves searched at this node without producing a cutoff, recorded
+    // so the history malus can be applied if a later quiet does cut. Pruned
+    // and illegal moves never reach the recording point, so only genuinely
+    // searched quiets are penalized.
+    Move quiets_tried[QUIETS_TRIED_CAP];
+    int  quiets_tried_n = 0;
+
     for (int i = 0; i < moves.count; i++) {
         Move m = moves.moves[i];
+
+        // Singular verification: the excluded move is invisible to this
+        // loop -- skipped before legality and before legal_count, so an
+        // only-move node sees zero legal moves, returns a mate/stalemate
+        // score, and fails the verification low (only-move == singular).
+        if (m == excluded_[ply])
+            continue;
 
         // LMR eligibility: checked BEFORE make_move so piece_at(to_sq(m))
         // correctly identifies captures (after make_move the captured piece
@@ -1173,7 +1406,8 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
         if (   !is_pv
             && !in_check
             && depth >= 1 && depth <= LMP_MAX_DEPTH
-            && legal_count >= LMP_TABLE[depth]
+            && legal_count >= (improving ? LMP_TABLE[depth]
+                                         : (2 * LMP_TABLE[depth]) / 3)
             && legal_count >= 1
             && !is_capture
             && move_type(m) != PROMOTION
@@ -1208,7 +1442,8 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
             && legal_count > 1
             && !is_capture
             && move_type(m) != PROMOTION
-            && static_eval + FUTILITY_MARGIN * depth <= alpha)
+            && static_eval + FUTILITY_MARGIN * depth
+                           + (improving ? FUT_IMPROVING_BONUS : 0) <= alpha)
         {
             board.unmake_move(m);
             continue;
@@ -1270,7 +1505,15 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                                  ply + 1, true, m);
             }
         } else {
-            score = -negamax(board, -beta, -alpha, depth - 1,
+            // Singular extension: a TT move that proved singular (see the
+            // verification above) searches one ply deeper. m == tt_move can
+            // only hold for the first legal move -- the TT move is ordered
+            // first and each move appears once -- and do_lmr is impossible
+            // there (legal_count == 1). The guard also covers a TT move
+            // that turned out illegal on make: the first legal is then a
+            // different move and gets no extension.
+            int ext = (singular_ext && m == tt_move) ? 1 : 0;
+            score = -negamax(board, -beta, -alpha, depth - 1 + ext,
                              ply + 1, true, m);
         }
         board.unmake_move(m);
@@ -1361,12 +1604,47 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                     {
                         store_killer(m, ply);
 
-                        // History bonus: depth^2 so deeper cutoffs count more.
-                        // Capped at HISTORY_MAX to prevent scores from drifting
-                        // above ORDER_KILLER2 (which would break the ordering tier).
-                        int bonus = depth * depth;
-                        int& entry = history_[board.side_to_move][from_sq(m)][to_sq(m)];
-                        entry = std::min(entry + bonus, HISTORY_MAX);
+                        // History update, two-sided with gravity. The move
+                        // that produced the cutoff gets a bonus; every quiet
+                        // searched before it at this node (they had their
+                        // chance and failed to cut) gets the symmetric malus.
+                        // The gravity form pulls entries toward the
+                        // +/-HISTORY_MAX asymptote in proportion to how far
+                        // they already are, so values never saturate into
+                        // indistinguishable clamps and stale entries decay as
+                        // new evidence accumulates. delta is clamped so a
+                        // single update cannot overshoot the asymptote
+                        // (depth^2 exceeds HISTORY_MAX only at theoretical
+                        // depths > 223); the multiply runs in 64-bit because
+                        // entry * delta does not fit 32 bits.
+                        int   delta = std::min(depth * depth, HISTORY_MAX);
+                        Color us    = board.side_to_move;
+
+                        int& entry = history_[us][from_sq(m)][to_sq(m)];
+                        entry += delta - int(int64_t(entry) * delta / HISTORY_MAX);
+
+                        // Continuation history: same gravity, same delta,
+                        // applied to this node's row (ch_row, computed at
+                        // the top of the node; null at the root and after a
+                        // null move). The board is back in this node's
+                        // state here -- m was unmade before the cutoff
+                        // bookkeeping -- so piece_at(from_sq()) yields the
+                        // moving piece, same as the countermove update
+                        // below relies on for prev_move.
+                        if (ch_row != nullptr) {
+                            int& ce = ch_row[board.piece_at(from_sq(m))][to_sq(m)];
+                            ce += delta - int(int64_t(ce) * delta / HISTORY_MAX);
+                        }
+
+                        for (int qi = 0; qi < quiets_tried_n; qi++) {
+                            Move q  = quiets_tried[qi];
+                            int& qe = history_[us][from_sq(q)][to_sq(q)];
+                            qe -= delta + int(int64_t(qe) * delta / HISTORY_MAX);
+                            if (ch_row != nullptr) {
+                                int& cq = ch_row[board.piece_at(from_sq(q))][to_sq(q)];
+                                cq -= delta + int(int64_t(cq) * delta / HISTORY_MAX);
+                            }
+                        }
 
                         // Countermove update: record m as the refutation of the
                         // opponent's previous move (prev_move). Skip when there
@@ -1383,12 +1661,21 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
                     }
 
                     // Store as lower bound: the real score may be even higher
-                    TT.store(board.hash, best_move, best_score,
-                             depth, BOUND_LOWER, ply);
+                    if (excluded_[ply] == MOVE_NONE)
+                        TT.store(board.hash, best_move, best_score,
+                                 stored_eval, depth, BOUND_LOWER, ply);
                     return alpha;
                 }
             }
         }
+
+        // Record searched quiets that did not produce a cutoff (the cutoff
+        // path returns above and is never recorded). is_capture was computed
+        // before make_move; pruned and illegal moves continue before this
+        // point and are correctly excluded.
+        if (!is_capture && move_type(m) != PROMOTION
+            && quiets_tried_n < QUIETS_TRIED_CAP)
+            quiets_tried[quiets_tried_n++] = m;
     }
 
     // -------------------------------------------------------------------------
@@ -1406,9 +1693,24 @@ Score Search::negamax(Board& board, Score alpha, Score beta,
     // -------------------------------------------------------------------------
     // EXACT if we improved alpha; UPPER if no move improved alpha (all failed low)
     BoundType bound = (best_score <= orig_alpha) ? BOUND_UPPER : BOUND_EXACT;
-    TT.store(board.hash, best_move, best_score, depth, bound, ply);
+    if (excluded_[ply] == MOVE_NONE)
+        TT.store(board.hash, best_move, best_score, stored_eval,
+                 depth, bound, ply);
 
     return best_score;
+}
+
+// =============================================================================
+// PER-GAME RESET
+// =============================================================================
+// Called from ucinewgame, with the search thread already joined by the
+// caller. Clears the tables whose signal deliberately persists across
+// searches within a game -- today, the continuation history (clearing its
+// 3.5 MB on every "go" would cost ~0.5 ms per move for nothing; the signal
+// learned earlier in the game is exactly what later moves want). Per-search
+// resets (killers, butterfly history, countermoves) live at the top of go().
+void Search::new_game() {
+    std::memset(conthist_, 0, sizeof(conthist_));
 }
 
 // =============================================================================
@@ -1459,6 +1761,8 @@ SearchResult Search::go(Board& board) {
     std::memset(killers_,      0, sizeof(killers_));
     std::memset(history_,      0, sizeof(history_));
     std::memset(countermoves_, 0, sizeof(countermoves_));
+    // conthist_ is deliberately NOT reset here: its signal persists across
+    // searches within a game and is cleared per game in new_game().
 
     // Advance TT generation. Entries written or refreshed before this point
     // belong to a previous search and are now eligible for replacement by
@@ -1506,7 +1810,13 @@ SearchResult Search::go(Board& board) {
         return result;
     }
 
-    int max_depth = (TM.depth_limit > 0) ? TM.depth_limit : MAX_PLY;
+    // Cap the iterative deepening at MAX_PLY - 1 regardless of what
+    // "go depth" requested: LMR_table is indexed by depth (valid indices
+    // 0..MAX_PLY-1) and single lines are capped at MAX_PLY - 1 anyway.
+    // cmd_go() clamps and reports; the min() here is defense in depth so
+    // no caller can drive the loop into an out-of-bounds table read.
+    int max_depth = (TM.depth_limit > 0) ? std::min(TM.depth_limit, MAX_PLY - 1)
+                                         : MAX_PLY - 1;
 
     for (int depth = 1; depth <= max_depth; depth++) {
         // Reset per-iteration state.

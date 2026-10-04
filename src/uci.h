@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-27 15:23
+// Last modified: 2026-07-05 14:20
 // uci.h -- Universal Chess Interface protocol handler
 //
 // Reads commands from stdin line by line and dispatches them to the engine.
@@ -43,12 +43,20 @@
 // Facon 1.6 -- Temple
 //   - "trace" command added: dumps the per-position coefficient vector
 //     produced by trace_evaluate() (see eval.h). Includes a built-in
-//     fidelity check that verifies the trace reconstructs evaluate() to
-//     the bit before printing. Intended for inspection by humans and as
+//     fidelity check comparing evaluate() against the score reconstructed
+//     from the trace (strict equality; in 1.6 the two could legitimately
+//     differ by up to 3 cp of blend rounding, so the check misfired on
+//     many middlegame positions). Intended for inspection by humans and as
 //     a ground truth for external tooling that consumes coefficient
 //     vectors. Not part of the UCI spec.
 //   - Comment audit pass: non-ASCII punctuation in comments replaced with
 //     ASCII equivalents for portability. No functional changes.
+//
+// Facon 1.7 -- Filo
+//   - Comment corrections only in this header: the 1.6 note above now
+//     states the fidelity check's actual 1.6 behavior. With the
+//     single-blend evaluation (see eval.cpp), strict equality is the
+//     correct contract and the check is exact.
 // =============================================================================
 
 #pragma once

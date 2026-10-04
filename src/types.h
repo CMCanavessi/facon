@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-04-25 21:29
+// Last modified: 2026-07-07 09:02
 // types.h -- Core type definitions for the Facon chess engine
 //
 // This file defines all the fundamental types used throughout the engine:
@@ -16,7 +16,7 @@
 //     make_move / make_promotion / from_sq / to_sq / move_type /
 //     promotion_type. CastlingRights mask. Score type with constants
 //     SCORE_INFINITE / SCORE_NONE / SCORE_MATE / SCORE_DRAW and
-//     is_mate_score(). MAX_MOVES (256) and MAX_PLY (128). square_to_string()
+//     is_mate_score(). MAX_MOVES (256) and MAX_PLY (256). square_to_string()
 //     for algebraic notation conversion.
 //
 // Facon 1.4 -- Hoja
@@ -25,6 +25,13 @@
 //     and uci.cpp where it was duplicated as a static function. Lives in
 //     types.h because it depends only on types defined here (Move, Square,
 //     from_sq, to_sq, move_type, promotion_type).
+//
+// Facon 1.7 -- Filo
+//   - MAX_PLY raised from 128 to 256. The mate-score bookkeeping always
+//     used a 512-ply window (is_mate_score(), score_to_tt/score_from_tt),
+//     so no score-space change is required. Selective depth at long time
+//     controls can exceed 128; 256 removes the truncation while keeping
+//     table indexing a power of two.
 // =============================================================================
 
 #pragma once
@@ -225,7 +232,15 @@ inline bool is_mate_score(Score s) {
 // =============================================================================
 
 constexpr int MAX_MOVES = 256;   // Safe upper bound on moves in any position
-constexpr int MAX_PLY   = 128;   // Maximum search depth
+
+// Maximum search-line length in plies. Lines that reach the cap return a
+// static evaluation instead of extending (ply guards in negamax() and
+// qsearch()); the cap bounds recursion depth (thread stack) and the per-ply
+// arrays. 256 covers selective depths beyond anything reachable at
+// realistic time controls, keeps 2D table indexing a power of two, and fits
+// comfortably inside the 512-ply mate-score window used by is_mate_score()
+// and score_to_tt()/score_from_tt().
+constexpr int MAX_PLY   = 256;
 
 // =============================================================================
 // SQUARE TO STRING

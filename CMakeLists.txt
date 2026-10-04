@@ -1,5 +1,5 @@
 # =============================================================================
-# Last modified: 2026-06-06 19:27
+# Last modified: 2026-09-18 22:32
 # CMakeLists.txt -- Build system for the Facon chess engine
 #
 # Facon 1.0 -- Oxido
@@ -49,6 +49,9 @@
 # Facon 1.6 -- Temple
 #   - Version bumped to 1.6. Codename "Temple".
 #
+# Facon 1.7 -- Filo
+#   - Version bumped to 1.7 for the development cycle.
+#
 # QUICK START
 # -----------
 # Linux (portable binary):
@@ -96,8 +99,8 @@ cmake_minimum_required(VERSION 3.16)
 # The rule below ("^dev") is what selects between the two formats, so no other
 # line needs editing when moving between development and release.
 
-project(facon VERSION 1.6 LANGUAGES CXX)
-set(FACON_CODENAME "Temple")
+project(facon VERSION 1.7 LANGUAGES CXX)
+set(FACON_CODENAME "Filo")
 
 # =============================================================================
 # VERSION STRING CONSTRUCTION

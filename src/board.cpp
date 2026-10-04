@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-18 21:02
-// board.cpp — Board state implementation: FEN parsing, make/unmake, queries
+// Last modified: 2026-09-15 12:57
+// board.cpp -- Board state implementation: FEN parsing, make/unmake, queries
 //
 // Facon 1.0 -- Oxido
 //   - Initial implementation: FEN parsing, make_move()/unmake_move() with full
@@ -42,19 +42,32 @@
 //   - all_attackers_to(Square, Bitboard occ): returns all attackers of both
 //     colors to a square using a given occupancy. Sliders (bishop, rook,
 //     queen) use the provided occ for x-ray discovery. Used by SEE.
+//
+// Facon 1.7 -- Filo
+//   - push_history(): new internal helper through which every history push
+//     goes. Compacts the window (discards the oldest half) when it fills,
+//     so no input can write past the end of history[]. See the analysis
+//     above its definition and the constants in board.h.
+//   - Non-ASCII punctuation in comments replaced with ASCII equivalents,
+//     following the convention for touched files.
+//   - pawn_hash maintained incrementally: put_piece(), remove_piece() and
+//     move_piece() XOR the pawn's piece_square entry into it alongside
+//     hash; make_move()/make_null_move() save it into StateInfo and the
+//     unmake paths restore it. Keys the pawn-evaluation cache in eval.cpp.
 // =============================================================================
 
 #include "board.h"
-#include "movegen.h"  // MoveList, generate_all_moves — needed by move_to_san()
+#include "movegen.h"  // MoveList, generate_all_moves -- needed by move_to_san()
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <cstring>   // std::memmove() in push_history()
 #include <random>
 #include <cctype>    // tolower() in set_fen()
 #include <cmath>     // std::abs() in make_move()
 
 // =============================================================================
-// ZOBRIST TABLES — definitions (declared extern in board.h)
+// ZOBRIST TABLES -- definitions (declared extern in board.h)
 // =============================================================================
 
 namespace Zobrist {
@@ -94,6 +107,8 @@ static inline void put_piece(Board& b, Piece p, Square s) {
     b.pieces[type_of(p)]    |= square_bb(s);
     b.by_color[color_of(p)] |= square_bb(s);
     b.hash ^= Zobrist::piece_square[p][s];
+    if (type_of(p) == PAWN)
+        b.pawn_hash ^= Zobrist::piece_square[p][s];
 }
 
 // Remove the piece on a square (square must be occupied)
@@ -103,6 +118,8 @@ static inline void remove_piece(Board& b, Square s) {
     b.pieces[type_of(p)]    &= ~square_bb(s);
     b.by_color[color_of(p)] &= ~square_bb(s);
     b.hash ^= Zobrist::piece_square[p][s];
+    if (type_of(p) == PAWN)
+        b.pawn_hash ^= Zobrist::piece_square[p][s];
 }
 
 // Move a piece from one square to another (destination must be empty)
@@ -115,6 +132,10 @@ static inline void move_piece(Board& b, Square from, Square to) {
     b.by_color[color_of(p)] ^= mask;
     b.hash ^= Zobrist::piece_square[p][from];
     b.hash ^= Zobrist::piece_square[p][to];
+    if (type_of(p) == PAWN) {
+        b.pawn_hash ^= Zobrist::piece_square[p][from];
+        b.pawn_hash ^= Zobrist::piece_square[p][to];
+    }
 }
 
 // =============================================================================
@@ -131,6 +152,7 @@ Board::Board() {
     half_move_clock  = 0;
     full_move_number = 1;
     hash             = 0;
+    pawn_hash        = 0;
     history_ply      = 0;
     game_ply         = 0;
 }
@@ -366,14 +388,49 @@ static const uint8_t CASTLING_RIGHTS_MASK[64] = {
     uint8_t(~BLACK_QUEENSIDE), 15, 15, 15, uint8_t(~(BLACK_KINGSIDE|BLACK_QUEENSIDE)), 15, 15, uint8_t(~BLACK_KINGSIDE)
 };
 
+// =============================================================================
+// HISTORY PUSH (with compaction)
+// =============================================================================
+// Returns the next free history slot. When the window is full, the oldest
+// half is discarded and the newest HISTORY_COMPACT_KEEP entries slide to the
+// front, so no input -- however long the game or the "position" move list --
+// can ever write past the end of history[].
+//
+// Discarding old entries is safe by construction:
+//   - Repetition detection scans back at most half_move_clock plies, and
+//     the fifty-move rule caps that at 100 -- far inside the kept window.
+//     Positions older than the last irreversible move cannot repeat anyway.
+//   - unmake_move()/unmake_null_move() pop relative to history_ply. A live
+//     search holds at most MAX_PLY pending frames, all among the newest
+//     entries; the static_assert in board.h guarantees they survive the
+//     compaction (their indices shift, but shift consistently, and nothing
+//     outside this struct holds pointers or absolute indices into the
+//     array).
+//   - game_ply is a pure counter, not an index; it keeps reporting the true
+//     game length.
+//
+// Cost: one predictable branch per push. The memmove itself (8 KB) runs
+// once every HISTORY_COMPACT_KEEP plies past the window size -- that is,
+// only in games beyond ~450 moves -- and takes nanoseconds.
+StateInfo& Board::push_history() {
+    if (history_ply >= MAX_GAME_HISTORY) {
+        std::memmove(&history[0],
+                     &history[MAX_GAME_HISTORY - HISTORY_COMPACT_KEEP],
+                     HISTORY_COMPACT_KEEP * sizeof(StateInfo));
+        history_ply = HISTORY_COMPACT_KEEP;
+    }
+    return history[history_ply++];
+}
+
 void Board::make_move(Move m) {
     // Save irreversible state before modifying anything
-    StateInfo& st      = history[history_ply++];
+    StateInfo& st      = push_history();
     st.captured_piece  = NO_PIECE;
     st.ep_square       = ep_square;
     st.castling_rights = castling_rights;
     st.half_move_clock = half_move_clock;
     st.hash            = hash;
+    st.pawn_hash       = pawn_hash;
     game_ply++;
 
     Square   from = from_sq(m);
@@ -469,7 +526,7 @@ void Board::unmake_move(Move m) {
 
     // Restore piece positions first (move_piece/put_piece/remove_piece also
     // XOR the hash incrementally, but we override with st.hash below so their
-    // hash side-effects are discarded — only the bitboard/piece_on updates
+    // hash side-effects are discarded -- only the bitboard/piece_on updates
     // from these calls matter here).
     if (mt == NORMAL) {
         move_piece(*this, to, from);
@@ -497,12 +554,13 @@ void Board::unmake_move(Move m) {
 
     // Restore all irreversible state from the history entry.
     // hash is restored LAST so that the piece-operation XORs above (which
-    // also touch hash incrementally) are completely overridden — the saved
+    // also touch hash incrementally) are completely overridden -- the saved
     // hash is always correct and requires no manual reversal.
     ep_square       = st.ep_square;
     castling_rights = st.castling_rights;
     half_move_clock = st.half_move_clock;
     hash            = st.hash;
+    pawn_hash       = st.pawn_hash;
 }
 
 // =============================================================================
@@ -512,11 +570,16 @@ void Board::unmake_move(Move m) {
 // Used in null move pruning during search to get a quick beta cutoff estimate.
 
 void Board::make_null_move() {
-    StateInfo& st      = history[history_ply++];
+    StateInfo& st      = push_history();
     st.ep_square       = ep_square;
     st.castling_rights = castling_rights;
     st.half_move_clock = half_move_clock;
     st.hash            = hash;
+    // A null move cannot change pawn placement, so this save/restore pair is
+    // a no-op today. It is kept for symmetry with make_move(): every field
+    // the unmake path restores is saved here, with no exceptions to
+    // remember.
+    st.pawn_hash       = pawn_hash;
     st.captured_piece  = NO_PIECE;
     game_ply++;
 
@@ -543,6 +606,7 @@ void Board::unmake_null_move() {
     castling_rights = st.castling_rights;
     half_move_clock = st.half_move_clock;
     hash            = st.hash;
+    pawn_hash       = st.pawn_hash;
     side_to_move    = ~side_to_move;
 
     if (side_to_move == BLACK)
@@ -556,11 +620,11 @@ void Board::unmake_null_move() {
 //   1. The from-square contains a piece belonging to the side to move.
 //   2. The move does not leave our own king in check.
 //
-// Check (1) is done first — it is O(1) and avoids the expensive board copy
+// Check (1) is done first -- it is O(1) and avoids the expensive board copy
 // for moves that come from a stale or hash-collided TT entry. Without this
 // guard, make_move() on a from-square that has NO_PIECE (or the wrong color)
 // silently "moves nothing", the king stays safe, and is_legal() incorrectly
-// returns true — causing illegal PV moves to be printed in long games where
+// returns true -- causing illegal PV moves to be printed in long games where
 // the TT is full of entries from earlier positions.
 
 bool Board::is_legal(Move m) const {
@@ -573,7 +637,7 @@ bool Board::is_legal(Move m) const {
         return false;
 
     // Full legality check: make the move on a copy and verify the king is safe.
-    // After make_move(), side_to_move has flipped — our king is ~copy.side_to_move.
+    // After make_move(), side_to_move has flipped -- our king is ~copy.side_to_move.
     Board copy = *this;
     copy.make_move(m);
     return !copy.is_attacked(copy.king_square(~copy.side_to_move), copy.side_to_move);
@@ -608,7 +672,7 @@ bool Board::is_repetition() const {
 //   Castling:    "O-O" or "O-O-O"
 //   Pawn push:   "e4", "e8=Q"
 //   Pawn capture:"exd5", "exd8=Q"
-//   Piece move:  "Nf3", "Bxd5" — with disambiguation if needed
+//   Piece move:  "Nf3", "Bxd5" -- with disambiguation if needed
 //   Check:       appended "+"
 //   Checkmate:   appended "#"
 //

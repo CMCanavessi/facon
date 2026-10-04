@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-06-06 19:27
+// Last modified: 2026-09-18 22:32
 // eval.h -- Position evaluation
 //
 // Returns a score in centipawns (100 = one pawn advantage) from the
@@ -119,15 +119,20 @@
 //     produce, for a given position, the vector of per-weight coefficients
 //     (white_count - black_count for each entry in eval_weights[]) plus the
 //     "additional score" for terms that lie outside the tunable array
-//     (mopup and king safety). The contract is:
+//     (material and mopup; king safety lived here too until it became a
+//     tunable group later in the 1.6 cycle). The contract is:
 //
 //         evaluate(board) ==
 //             dot(trace.coefficients, eval_weights) + trace.additional_score
 //
-//     to the bit. trace_evaluate() is a parallel implementation of
+//     which in 1.6 held to within 3 cp of blend rounding (evaluate()
+//     applied the tapered blend in four places, the reconstruction in one;
+//     integer division does not distribute over addition).
+//     trace_evaluate() is a parallel implementation of
 //     evaluate() that counts feature occurrences instead of multiplying
-//     them by weights. It is exposed through the UCI "trace <fen>" command
-//     for inspection. Not used in the search hot path -- adds no cost to
+//     them by weights. It is exposed through the UCI "trace" command
+//     (operates on the current position, takes no arguments) for
+//     inspection. Not used in the search hot path -- adds no cost to
 //     normal play. The function exists so that external evaluation tooling
 //     that consumes per-position coefficient vectors can verify, position
 //     by position, that its own extraction matches the engine's evaluation.
@@ -152,6 +157,23 @@
 //     (king proximity, blockade by an enemy minor/major, free path, and pawn
 //     protection). Each feature was added and validated individually. Tapered
 //     and tunable; see the W_POS2_* offsets below.
+//
+// Facon 1.7 -- Filo
+//   - evaluate() unified to a single tapered blend mirroring the EvalTrace
+//     decomposition (see eval.cpp). The evaluate() == score_from_trace()
+//     contract documented below now holds bit-for-bit as written; in 1.6 it
+//     held to within 3 cp of blend rounding because evaluate() blended in
+//     four places while the reconstruction blends once.
+//   - Comment corrections in the 1.6 notes above: additional_score holds
+//     material and mopup (king safety left it during the 1.6 cycle), and
+//     the trace command operates on the current position and takes no FEN.
+//   - Weight-layout map corrected for the shelter/storm block: 2 file
+//     categories (king file / adjacent share one set), not 3 files -- the
+//     geometry scans three files but the weights collapse them into two
+//     categories, giving the 32 slots the offsets always declared.
+//   - Threat group added to eval_weights[] (THREAT_START, 12 slots): pawn
+//     attacks on minors and majors, minor attacks on majors, rook attacks
+//     on the queen, hanging enemy pieces, and threatening pawn pushes.
 // =============================================================================
 
 #pragma once
@@ -204,20 +226,20 @@ constexpr Score PIECE_VALUE[7] = {
 // each group. To read a specific weight, callers compute the absolute index
 // as `GROUP_START + offset_within_group`.
 //
-// Why a flat array instead of named constants. The first-pass tuner consumes
+// Why a flat array instead of named constants. The offline weight-fitting process consumes
 // weights as a single contiguous vector that it can modify in place at each
 // iteration. Mapping every named constant to a slot of one shared array is
 // what makes that loop possible. The cost of this design is that reading a
 // weight is slightly more verbose at the call site ("eval_weights[MOBILITY_START
 // + 2]" instead of "MOBILITY_KNIGHT_MG"); the gain is that the engine and
-// the tuner agree on exactly one source of truth for every value.
+// the fitting process agree on exactly one source of truth for every value.
 //
 // Why offsets rather than one enum entry per individual weight. Per-weight
 // entries (W_PAWN_ISOLATED_MG, W_PAWN_ISOLATED_EG, ...) would balloon to
 // ~820 enum constants and tie us tightly to a flat naming scheme. The
-// tuner's data structures are naturally grouped (one int16_t coefficient
+// fitting process's data structures are naturally grouped (one int16_t coefficient
 // array per feature group), so matching the engine's layout to that
-// grouping keeps the mapping between engine and tuner trivial.
+// grouping keeps the mapping between engine and fitting process trivial.
 //
 // What is NOT in eval_weights:
 //   - PIECE_VALUE[] (material values): stable enough not to need tuning at
@@ -225,7 +247,7 @@ constexpr Score PIECE_VALUE[7] = {
 //   - MOPUP_*: mopup is out of the tuning scope by design (it is a tactical
 //     guidance term for already-decided endings, not a positional weight).
 //   - KING_ATTACK_WEIGHT[] / SAFETY_SCALE: king safety stays single-valued
-//     (no MG/EG split) due to its quadratic shape, which a linear tuner
+//     (no MG/EG split) due to its quadratic shape, which a linear fitting model
 //     cannot move sensibly. A separate refactor to a tunable lookup table
 //     will replace these in a later dev.
 //   - PHASE_VALUE[] and TOTAL_PHASE: tapering machinery, not weights.
@@ -268,8 +290,10 @@ constexpr Score PIECE_VALUE[7] = {
 //                                       * 2 phases. Linear/bucketed (tunable);
 //                                       see the TROP_* offsets and tropism()
 //                                       in eval.cpp.
-//   [868, 900)  SHELTER_STORM_START    Pawn shelter (3 files * 4 distance
-//                                       buckets) and pawn storm, * 2 phases.
+//   [868, 900)  SHELTER_STORM_START    Pawn shelter and storm: 2 file
+//                                       categories (king file / adjacent) *
+//                                       4 distance buckets * 2 phenomena,
+//                                       * 2 phases = 32 slots.
 //                                       Tunable; see the W_SS_* offsets and
 //                                       shelter_storm() in eval.cpp.
 //   [900, 916)  KING_SAFETY_V2_START   Open/semi-open files toward the king
@@ -327,7 +351,14 @@ constexpr int KING_SAFETY_V2_START = 900;
 // tempo (1 pair) + bishop outpost (2 pairs) + passed-pawn refinement
 // (king proximity own/enemy, blockade minor/major, free path, protected; 6 pairs).
 constexpr int POSITIONAL2_START    = 916;
-constexpr int NUM_WEIGHTS          = 934;
+// Threat group (1.7), appended at the end so no pre-existing offset moves.
+// Six threat families, each tapered: pawn attacks on a minor and on a major,
+// minor attacks on a major, rook attacks on the queen, enemy pieces attacked
+// and undefended, and safe pawn pushes that would create a threat.
+// 6 terms * 2 phases = 12 slots. See the W_THREAT_* offsets below and
+// threat_counts_from_maps() in eval.cpp.
+constexpr int THREAT_START         = 934;
+constexpr int NUM_WEIGHTS          = 946;
 
 // Offsets within the PAWN_STRUCT group.
 // Use as: eval_weights[PAWN_STRUCT_START + W_PAWN_ISOLATED_MG], etc.
@@ -373,8 +404,8 @@ constexpr int W_KNIGHT_OUTPOST_SUPPORTED_EG = 3;
 // Offsets within the KING_SAFETY group.
 // Use as: eval_weights[KING_SAFETY_START + W_KS_ATTACKER_KNIGHT_MG], etc.
 //
-// King safety is expressed as a SUM OF LINEAR TERMS so it can be Texel-tuned
-// (the tuner optimises a strictly linear model; a quadratic penalty cannot be
+// King safety is expressed as a SUM OF LINEAR TERMS so it can be fitted from game data
+// (the fitting process optimises a strictly linear model; a quadratic penalty cannot be
 // fit directly). Two complementary families of terms:
 //
 //   (a) Per-attacker-type weight: one weight per enemy piece type that
@@ -384,7 +415,7 @@ constexpr int W_KNIGHT_OUTPOST_SUPPORTED_EG = 3;
 //   (b) Attacker-count buckets: one weight per distinct count of attacking
 //       pieces (1, 2, 3, 4-or-more). Each bucket is a binary feature
 //       ("exactly N attackers present" -> 1), which keeps the model linear
-//       while letting the tuner make three attackers cost far more than three
+//       while letting the fit make three attackers cost far more than three
 //       times one attacker. This recovers the non-linearity the old quadratic
 //       captured, but with a structural ceiling (the 4+ bucket) instead of an
 //       unbounded square -- so the runaway penalties that sank the 1.5
@@ -424,13 +455,13 @@ constexpr int W_KS_COUNT_4PLUS_EG = 15;
 // of your knights, bishops, rooks and queens, the Chebyshev distance to the
 // enemy king is bucketed into {1, 2, 3, 4-or-more}, and that (piece, bucket)
 // weight is added. Bucketing (rather than a single linear distance term) lets
-// the tuner assign an independent value to each ring around the king, so the
+// the fit assign an independent value to each ring around the king, so the
 // distance->value relationship can be non-linear (e.g. a knight adjacent to
 // the king worth far more than one three squares away). Distance 4+ shares one
 // bucket -- a piece that far rarely exerts king pressure.
 //
 // Layout: per piece type, four (MG, EG) bucket pairs in ascending distance.
-// All tapered; the tuner is free to push the EG side toward 0 if king pressure
+// All tapered; the fit is free to push the EG side toward 0 if king pressure
 // is mainly a middlegame concern, with the phase blend handling the fade.
 constexpr int W_TROP_KNIGHT_D1_MG = 0;
 constexpr int W_TROP_KNIGHT_D1_EG = 1;
@@ -610,6 +641,46 @@ constexpr int W_POS2_PASSER_FREE_PATH_EG     = 15;
 constexpr int W_POS2_PASSER_PROTECTED_MG     = 16;
 constexpr int W_POS2_PASSER_PROTECTED_EG     = 17;
 
+// Offsets within the THREAT group (1.7).
+// Use as eval_weights[THREAT_START + W_THREAT_*].
+//
+// Threats are counted by ATTACKER TYPE and VICTIM CLASS rather than as one
+// generic "attacked piece" term, because their meanings differ: a pawn
+// attacking a knight usually wins a tempo or material outright, while a
+// rook attacking a queen mostly gains time. Each family gets its own
+// tunable weight pair.
+constexpr int W_THREAT_PAWN_ON_MINOR_MG  =  0;
+constexpr int W_THREAT_PAWN_ON_MINOR_EG  =  1;
+constexpr int W_THREAT_PAWN_ON_MAJOR_MG  =  2;
+constexpr int W_THREAT_PAWN_ON_MAJOR_EG  =  3;
+constexpr int W_THREAT_MINOR_ON_MAJOR_MG =  4;
+constexpr int W_THREAT_MINOR_ON_MAJOR_EG =  5;
+constexpr int W_THREAT_ROOK_ON_QUEEN_MG  =  6;
+constexpr int W_THREAT_ROOK_ON_QUEEN_EG  =  7;
+constexpr int W_THREAT_HANGING_MG        =  8;
+constexpr int W_THREAT_HANGING_EG        =  9;
+constexpr int W_THREAT_PAWN_PUSH_MG      = 10;
+constexpr int W_THREAT_PAWN_PUSH_EG      = 11;
+
+// Endgame scale factors (1.7). The final evaluation is multiplied by
+// scale / SCALE_NORMAL when the material signature says the position is
+// drawish. These are NOT tuned weights: they are structural knowledge
+// about which material combinations can be converted.
+//
+// Deliberately, none of them is ZERO. A hard override to 0 was tried in
+// 1.5 and cost about 30 Elo through the search. The likeliest reason is
+// loss of gradient: with an exact 0 the engine cannot tell "keep the
+// bishop" from "give the bishop away" -- both evaluate identically -- so
+// it will shed material for nothing, and the evaluation jumps
+// discontinuously the moment the last pawn comes off. A small non-zero
+// factor says "this is a draw" just as clearly (KB vs K drops from ~+330
+// to ~+10, far below anything that would make the engine decline a draw)
+// while keeping the ordering between "still have the piece" and "do not".
+constexpr int SCALE_NORMAL  = 128;  // no scaling
+constexpr int SCALE_OCB     = 48;   // opposite-coloured bishops
+constexpr int SCALE_DRAWISH = 32;   // rook vs minor, pawnless
+constexpr int SCALE_DRAWN   = 4;    // the strong side cannot force mate
+
 // Passed-pawn bonus is read as eval_weights[PASSED_BONUS_START + rank*2 + 0]
 // for the MG value and eval_weights[PASSED_BONUS_START + rank*2 + 1] for EG.
 // Ranks are White-relative (0..7); pawn_structure() mirrors Black's rank.
@@ -711,9 +782,9 @@ void evaluate_verbose(const Board& board);
 //         score_from_trace(trace, eval_weights, board.side_to_move)
 //
 // where `trace` is filled by trace_evaluate(board, trace). The contract
-// is checked at runtime by the UCI "trace" command on a sample of FENs;
-// any divergence indicates a bug in trace_evaluate that has to be fixed
-// before the trace can be trusted.
+// is checked at runtime by the UCI "trace" command on the current
+// position; any divergence indicates a bug that has to be fixed before
+// the trace can be trusted.
 //
 // Layout of `coefficients`. Indices match `eval_weights[]` slot for slot,
 // so coefficients[i] is the count for weights[i]. The MG / EG roles of
@@ -738,6 +809,14 @@ struct EvalTrace {
     // side to move is the caller's responsibility, just as it is in
     // evaluate().
     Score additional_score;
+
+    // Endgame scale factor in effect for this position (SCALE_NORMAL when
+    // no drawish signature matched). Recorded here rather than recomputed
+    // by the consumer so score_from_trace() needs no board. Like the mopup
+    // contribution above, it is decided at trace time using the live
+    // weights; a consumer plugging in a different weight set inherits that
+    // decision, which is the same approximation mopup already makes.
+    int endgame_scale;
 };
 
 // Fill `trace` with the coefficient vector and additional-score contribution

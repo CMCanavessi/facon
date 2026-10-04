@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-27 15:23
+// Last modified: 2026-07-11 09:25
 // uci.cpp -- UCI protocol implementation
 //
 // Facon 1.0 -- Oxido
@@ -73,6 +73,32 @@
 //     part of the UCI spec; not in the search hot path.
 //   - Comment audit pass: non-ASCII punctuation in comments replaced with
 //     ASCII equivalents for portability. No functional changes.
+//
+// Facon 1.7 -- Filo
+//   - cmd_setoption() Hash: the declared option range is now actually
+//     enforced. The value is accumulated with saturating arithmetic
+//     (immune to integer overflow regardless of digit count -- previously
+//     a large enough value overflowed a plain int into undefined behavior
+//     before any check could see it), then clamped to
+//     [HASH_MIN_MB, HASH_MAX_MB] with an explanatory info string. Before
+//     resizing, the search thread is brought to a clean stop (same
+//     signal-then-join pattern as ucinewgame/stop), closing a race between
+//     resize() and TT probes from a live search. All Hash diagnostics are
+//     UCI-valid "info string" lines on stdout.
+//   - cmd_uci(): the Hash option line is built from HASH_DEFAULT_MB /
+//     HASH_MIN_MB / HASH_MAX_MB (tt.h) instead of hardcoded numbers, so
+//     the advertised range and the enforced range cannot diverge.
+//   - cmd_trace(): the additional_score label now reads "material + mopup"
+//     -- king safety stopped living in additional_score when it became a
+//     tunable group in 1.6, but the label was never updated. The strict
+//     equality fidelity check is unchanged: with the single-blend
+//     evaluation (see eval.cpp) it is now the correct contract.
+//   - cmd_go(): "go depth" is clamped to MAX_PLY - 1 with an explanatory
+//     info string -- the same declare-and-enforce principle as the Hash
+//     option. Unclamped requests previously reached LMR_table[depth] out
+//     of bounds inside the search.
+//   - cmd_ucinewgame(): also resets the per-game search tables
+//     (Searcher.new_game() -- continuation history).
 // =============================================================================
 
 #include "version.h"
@@ -125,7 +151,9 @@ void UCI::cmd_uci() {
     std::cout << "id name Facon " << FACON_VERSION << "\n";
     std::cout << "id author Carlos M. Canavessi\n";
     std::cout << "\n";
-    std::cout << "option name Hash type spin default 16 min 1 max 1024\n";
+    std::cout << "option name Hash type spin default " << HASH_DEFAULT_MB
+              << " min " << HASH_MIN_MB
+              << " max " << HASH_MAX_MB << "\n";
     std::cout << "uciok\n" << std::flush;
 }
 
@@ -154,6 +182,9 @@ void UCI::cmd_ucinewgame() {
     }
     // Clear the TT: entries from a previous game can mislead the search
     TT.clear();
+    // Per-game search tables (continuation history). The search thread is
+    // already joined above, so this cannot race with an active search.
+    Searcher.new_game();
     board_.set_startpos();
 }
 
@@ -208,7 +239,17 @@ void UCI::cmd_go(std::istringstream& ss) {
         else if (token == "winc")     ss >> TM.inc_white;
         else if (token == "binc")     ss >> TM.inc_black;
         else if (token == "movetime") ss >> TM.movetime;
-        else if (token == "depth")    ss >> TM.depth_limit;
+        else if (token == "depth") {
+            ss >> TM.depth_limit;
+            // Declare-and-enforce, same principle as the Hash option: the
+            // search indexes depth-sized tables (LMR_table) and caps lines
+            // at MAX_PLY - 1, so a larger request is clamped and reported.
+            if (TM.depth_limit > MAX_PLY - 1) {
+                TM.depth_limit = MAX_PLY - 1;
+                std::cout << "info string depth value too large, clamped to "
+                          << (MAX_PLY - 1) << "\n" << std::flush;
+            }
+        }
         else if (token == "infinite") TM.infinite = true;
         else if (token == "movestogo") ss >> TM.movestogo;
     }
@@ -272,12 +313,48 @@ void UCI::cmd_setoption(std::istringstream& ss) {
         bool valid = !value.empty();
         for (char c : value) if (c < '0' || c > '9') { valid = false; break; }
         if (!valid) {
-            std::cout << "setoption: invalid Hash value\n" << std::flush;
+            std::cout << "info string Hash value invalid, ignored\n"
+                      << std::flush;
             return;
         }
-        int mb = 0;
-        for (char c : value) mb = mb * 10 + (c - '0');
-        TT.resize(mb);
+
+        // Saturating accumulation: the moment the running value exceeds
+        // HASH_MAX_MB it sticks just above the maximum, so no input --
+        // however many digits -- can overflow the accumulator. The old code
+        // accumulated into a plain int with no range check: a large enough
+        // value overflowed into undefined behavior before resize() ever
+        // saw it.
+        uint64_t mb = 0;
+        for (char c : value) {
+            mb = mb * 10 + uint64_t(c - '0');
+            if (mb > uint64_t(HASH_MAX_MB))
+                mb = uint64_t(HASH_MAX_MB) + 1;
+        }
+
+        // Enforce the range the option declares. It was advertised as
+        // "min 1 max N" before but never enforced -- out-of-range values
+        // went straight to resize().
+        if (mb > uint64_t(HASH_MAX_MB)) {
+            mb = uint64_t(HASH_MAX_MB);
+            std::cout << "info string Hash value too large, clamped to "
+                      << HASH_MAX_MB << " MB\n" << std::flush;
+        } else if (mb < uint64_t(HASH_MIN_MB)) {
+            mb = uint64_t(HASH_MIN_MB);
+            std::cout << "info string Hash value too small, set to "
+                      << HASH_MIN_MB << " MB\n" << std::flush;
+        }
+
+        // Resizing while the search thread runs would race with TT.probe()
+        // and TT.store(). Bring the search to a clean stop first -- same
+        // signal-then-join pattern as cmd_ucinewgame(): the search thread
+        // prints its "bestmove" on the way out, so a GUI that sends
+        // setoption mid-search still sees a well-formed protocol exchange.
+        if (search_thread_.joinable()) {
+            TM.stop = true;
+            search_thread_.join();
+        }
+
+        TT.resize(int(mb));
     }
 }
 
@@ -331,7 +408,7 @@ void UCI::cmd_trace() {
     std::cout << "=== trace ===\n";
     std::cout << "phase_mg         : " << trace.phase_mg << " /256\n";
     std::cout << "additional_score : " << trace.additional_score
-              << " cp  (material + king safety + mopup, from White's POV)\n";
+              << " cp  (material + mopup, from White's POV)\n";
     std::cout << "engine evaluate(): " << engine_score
               << " cp  (from side-to-move's POV)\n";
     std::cout << "trace recons.    : " << trace_score

@@ -1,5 +1,5 @@
 # Facón Chess Engine
-<!-- Last modified: 2026-06-11 18:05 -->
+<!-- Last modified: 2026-10-04 00:08 -->
 
 <p align="center">
   <img src="assets/logos/facon-banner.png" alt="Facon Chess Engine" width="640"/>
@@ -9,11 +9,11 @@ A UCI-compliant chess engine written in C++17.
 
 *by Carlos M. Canavessi*
 
-![Version](https://img.shields.io/badge/version-1.6%20Temple-8B0000)
+![Version](https://img.shields.io/badge/version-1.7%20Filo-8B0000)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 ![Protocol](https://img.shields.io/badge/protocol-UCI-green)
-![Elo](https://img.shields.io/badge/Ordo%20Elo-~2800-yellow)
+![Elo](https://img.shields.io/badge/Ordo%20Elo-~2930-yellow)
 
 ---
 
@@ -25,29 +25,30 @@ Each version carries a codename that follows the knife-making process: from roug
 
 ---
 
-## Current Version: 1.6 "Temple"
+## Current Version: 1.7 "Filo"
 
-> *The tempering. Heat and quench -- where the blade gains its hardness and its spring.*
+> *The edge. Whetstone and patience -- where hardness finally becomes sharpness.*
 
-The seventh release, focused on a deliberate evaluation overhaul: every tunable weight centralized into a single vector and optimized with Texel tuning, phase-tapered piece-square tables, and three new evaluation feature groups (pawn shelter/storm, a second king-safety layer, and a positional refinement group). Measured at approximately **+250 Elo** over version 1.5 (Ordo ~2800); +222.8 Elo in direct self-play vs 1.5 (n=10000). Startup is now effectively instant thanks to hardcoded magic numbers.
+The eighth release, and the largest gain since the engine's early days -- split almost evenly between search and evaluation, with no single change dominating. On the search side: a family of history tables, a static evaluation cached in the transposition table that also drives improving-aware pruning, singular extensions, ProbCut, and a pawn-structure cache. On the evaluation side: threat evaluation by attacker and victim, endgame scaling that resolves the drawn-pawnless-ending limitation carried since 1.5, and a re-fitted weight set. Measured at approximately **+130 Elo** over version 1.6 (Ordo ~2930); +139.1 Elo in direct self-play vs 1.6 (n=10000).
 
-### What's new in 1.6
+### What's new in 1.7
 
-- **Weight centralization + Texel tuning** — every evaluation weight collected into a single flat array (934 entries) and optimized with Texel tuning on a labeled quiet-position dataset. Material folded into the PSTs post-tune, so `PIECE_VALUE` stays fixed while the evaluation reproduces the tuned values.
-- **Tapered piece-square tables** — each PST square now holds separate middlegame and endgame values, blended by game phase. Lets the evaluation express phase-dependent placement (king centralization, advanced pawns, etc.).
-- **Pawn shelter / storm** — new tunable group scoring the pawn cover in front of each king (shelter, by rank gap) and enemy pawns advancing on the king's files (storm, by advancement).
-- **Second king-safety layer** — open/semi-open files toward the king and safe-check squares per piece type, complementing the existing attacker-count king safety.
-- **Tempo** — a bonus for the side to move. +19 Elo, the single most valuable feature added in 1.6.
-- **Bishop outpost** — a bishop on an advanced square no enemy pawn can challenge, with a larger bonus when pawn-supported. Mirrors the knight outpost. +6.6 Elo.
-- **Passed-pawn refinement** — king proximity (escort your passer, keep the enemy king away), blockade (enemy piece on the stop square; a minor blockades better than a major), free path to promotion, and pawn protection. +10.6 Elo as a group.
-- **Hardcoded magic numbers** — the bishop/rook magics, previously searched at startup, are now baked-in constants. Startup dropped from ~261 ms to ~11 ms (~96% faster); attacks are bit-identical. The search is preserved under a compile flag for offline regeneration.
-- **`trace` UCI command** — prints the linear coefficient decomposition of the evaluation and the engine-vs-trace fidelity check, complementing the `eval` command from 1.5.
+- **Two-sided history** -- the butterfly history table now penalizes the quiet moves searched before the one that caused a cutoff, as well as rewarding that one, with a gravity update that decays entries instead of saturating them. +15 Elo.
+- **Continuation history** -- a second history table conditioned on the opponent's previous move: how good a move has been as a reply to that specific move. +25 Elo.
+- **Static evaluation in the transposition table** -- every position outside check gets a static evaluation, cached in the table at no size cost. The search uses it to tell whether its position is improving, and modulates reverse futility, futility and late-move pruning accordingly. +20 Elo.
+- **Singular extensions** -- when the transposition table shows one move to be the only good one, that move is searched one ply deeper. +5 Elo.
+- **ProbCut** -- a shallow search of a sound capture that already beats beta by a margin cuts the node early. Slightly positive; kept for the tree reduction it gives at depth.
+- **Pawn-structure cache** -- a second Zobrist key covering pawn placement alone, under which the pawn evaluation is cached. +20 Elo from speed alone, with an unchanged benchmark signature.
+- **Threat evaluation** -- what each side attacks, broken down by attacker and victim: pawns on minor and major pieces, minors on majors, rooks on the queen, undefended pieces, and pawn pushes that would create a threat. +50 Elo, the largest single gain of the release.
+- **Endgame scaling** -- material configurations that cannot be converted (a lone minor, two knights, same-colored bishops, rook against a minor, opposite-colored bishops) are scaled toward a draw, never clamped to zero. +8 Elo, and resolves the drawn-pawnless-ending limitation carried since 1.5.
+- **Re-fitted weight set** -- all 946 evaluation weights re-optimized after the threat terms were added. +6 Elo.
 
-### Features attempted and rejected in 1.6
+### Features attempted and rejected in 1.7
 
-- **Rook behind passed pawn (Tarrasch rule)** — -9 Elo; redundant with the rook PST.
-- **Non-linear mobility** — -12 Elo; overfit, the linear mobility is more robust.
-- **Material imbalance (Kaufman-style)** — approximately neutral; the tuning redistributed existing PST value rather than adding signal, and self-play confirmed redundancy.
+- **Capture history** -- roughly neutral over 16,250 games; the existing capture ordering already carried that signal.
+- **History pruning** -- dropped before testing: the history signal is excellent for ordering moves and unsuitable as an absolute pruning threshold.
+- **Principal variation search** (two forms) -- both measured negative; scouting traded the exact scores the transposition table relied on for bounds.
+- **Correction history** -- never separated from zero.
 
 ---
 
@@ -55,6 +56,7 @@ The seventh release, focused on a deliberate evaluation overhaul: every tunable 
 
 | Version | Codename   | Ordo Elo | Gain |
 |---------|------------|----------|------|
+| 1.7     | Filo       | ~2930    | +130 vs 1.6 |
 | 1.6     | Temple     | ~2800 | +250 vs 1.5 |
 | 1.5     | Espiga     | ~2550    | +220 vs 1.4 |
 | 1.4     | Hoja       | ~2330    | +430 vs 1.3 |
@@ -63,7 +65,7 @@ The seventh release, focused on a deliberate evaluation overhaul: every tunable 
 | 1.1     | Herrumbre  | ~1360    | +140 vs 1.0 |
 | 1.0     | Oxido      | ~1220    | baseline |
 
-Gauntlet methodology: 26 opponents, 40 games each (1040 total), 2min+1sec, balanced opening book. Ordo rating computed across all versions in a combined rating list. 1.6 was tested against a high-Ordo field (Gauntlet 4); the combined-list Ordo places it in the 2800 range, and direct self-play vs 1.5 measured +222.8 Elo (n=10000).
+Gauntlet methodology: 26 opponents, 40 games each (1040 total), 2min+1sec, each opening played with both colors. Ordo rating computed across all versions in a combined rating list. 1.7 was measured against the same high-Ordo field as 1.6 (Gauntlet 4), so the two compare on identical opposition: the combined-list Ordo places 1.7 at ~2930, and direct self-play vs 1.6 measured +139.1 Elo (n=10000). A second gauntlet against a stronger field is being run with a balanced opening book. 1.6 was independently rated ~2800 on the CCRL Blitz list (1055 games), matching its gauntlet estimate.
 
 ---
 
@@ -97,7 +99,7 @@ cmake .. \
 make -j$(nproc)
 ```
 
-The resulting binary (`facon-1.6` / `facon-1.6.exe`) is statically linked and has no external dependencies.
+The resulting binary (`facon-1.7` / `facon-1.7.exe`) is statically linked and has no external dependencies.
 
 ---
 
@@ -107,17 +109,17 @@ Facón communicates via the UCI protocol. Any UCI-compatible GUI works: [Arena](
 
 ### Quick start
 ```
-$ ./facon-1.6
+$ ./facon-1.7
 uci
-id name Facon 1.6 - Temple
+id name Facon 1.7 - Filo
 id author Carlos M. Canavessi
-option name Hash type spin default 16 min 1 max 1024
+option name Hash type spin default 16 min 1 max 1048576
 uciok
 isready
 readyok
 position startpos
 go movetime 2000
-info depth 1 seldepth 1 score cp 37 nodes 41 nps 0 time 0 hashfull 0 pv g1f3
+info depth 1 seldepth 1 score cp 32 nodes 41 nps 0 time 0 hashfull 0 pv g1f3
 ...
 bestmove g1f3
 ```
@@ -126,7 +128,7 @@ bestmove g1f3
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `Hash` | spin | 16 | Transposition table size in MB (1-1024) |
+| `Hash` | spin | 16 | Transposition table size in MB (1-1048576) |
 
 ### Non-UCI commands
 
@@ -134,7 +136,7 @@ bestmove g1f3
 |---------|-------------|
 | `eval`  | Print a per-component breakdown of the static evaluation for the current position. |
 | `trace` | Print the linear coefficient decomposition of the evaluation (the per-weight multipliers used by Texel tuning) and an engine-vs-trace fidelity check. |
-| `bench` | Run the benchmark on 10 hand-crafted positions; reports per-position nodes and total NPS. `bench verbose` for full search output, `bench depth N` to override the default depth (18). Also available as a command-line invocation (`./facon-1.6 bench`) which runs the benchmark and exits without entering the UCI loop. |
+| `bench` | Run the benchmark on 10 hand-crafted positions; reports per-position nodes and total NPS. `bench verbose` for full search output, `bench depth N` to override the default depth (18). Also available as a command-line invocation (`./facon-1.7 bench`) which runs the benchmark and exits without entering the UCI loop. |
 | `perft N` | Count leaf nodes to depth N from the current position. `perft divide N` for per-first-move breakdown. |
 | `d` | Print the current board state. |
 
@@ -147,12 +149,12 @@ facon/
 ├── src/
 │   ├── types.h         — Core types: Square, Piece, Move, Bitboard, move_to_uci()
 │   ├── bitboard.h/.cpp — Magic bitboards, attack tables
-│   ├── board.h/.cpp    — Board state, make/unmake, Zobrist hashing, all_attackers_to()
+│   ├── board.h/.cpp    — Board state, make/unmake, Zobrist hashing (position and pawn keys), all_attackers_to()
 │   ├── movegen.h/.cpp  — Pseudo-legal move generation (captures include quiet queen promotions)
-│   ├── eval.h/.cpp     — Tapered, Texel-tuned evaluation: material+PST (folded), king safety (two layers), shelter/storm, mopup, pawn structure, tropism, positional2 (tempo, bishop outpost, passed-pawn refinement), evaluate_verbose, trace_evaluate
-│   ├── tt.h/.cpp       — Transposition table (depth-preferred replacement, generation/aging)
+│   ├── eval.h/.cpp     — Tapered, Texel-tuned evaluation: material+PST (folded), king safety (two layers), shelter/storm, mopup, pawn structure, tropism, positional2 (tempo, bishop outpost, passed-pawn refinement), threat evaluation, endgame scaling, pawn-structure cache, evaluate_verbose, trace_evaluate
+│   ├── tt.h/.cpp       — Transposition table (depth-preferred replacement, generation/aging, cached static evaluation)
 │   ├── timeman.h/.cpp  — Time management
-│   ├── search.h/.cpp   — Negamax, LMR, NMP, SEE, futility, razoring, LMP, IIR, countermove, ID
+│   ├── search.h/.cpp   — Negamax, LMR, NMP, SEE, futility, razoring, LMP, IIR, ProbCut, singular extensions, history (butterfly + continuation), countermove, ID
 │   ├── uci.h/.cpp      — UCI protocol handler, bench, eval, perft commands
 │   ├── main.cpp        — Entry point
 │   ├── version.h.in    — Version header template (CMake-generated)
@@ -170,7 +172,8 @@ facon/
 │   ├── v1.3.md         — Technical documentation for v1.3
 │   ├── v1.4.md         — Technical documentation for v1.4
 │   ├── v1.5.md         — Technical documentation for v1.5
-│   └── v1.6.md         — Technical documentation for v1.6
+│   ├── v1.6.md         — Technical documentation for v1.6
+│   └── v1.7.md         — Technical documentation for v1.7
 ├── CMakeLists.txt
 ├── CHANGELOG.md
 └── README.md
@@ -188,4 +191,4 @@ facon/
 
 - [Chess Programming Wiki](https://www.chessprogramming.org/) — reference for all chess engine techniques
 - [CCRL](https://www.computerchess.org.uk/ccrl/) — computer chess rating list
-- [Gediminas Masaitis' texel-tuner](https://github.com/GediminasMasaitis/texel-tuner) — the Texel tuning framework used to optimize Facon's evaluation weights in 1.6
+- [Gediminas Masaitis' texel-tuner](https://github.com/GediminasMasaitis/texel-tuner) — the Texel tuning framework used to optimize Facon's evaluation weights in 1.6 and 1.7

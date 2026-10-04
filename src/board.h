@@ -1,6 +1,6 @@
 // =============================================================================
-// Last modified: 2026-04-18 21:02
-// board.h — Chess board state representation
+// Last modified: 2026-09-15 12:57
+// board.h -- Chess board state representation
 //
 // The Board struct holds the complete state of a chess position and provides
 // methods to make/unmake moves, parse FEN strings, and query the position.
@@ -16,6 +16,22 @@
 //   - all_attackers_to(Square, Bitboard occ): returns all attackers of both
 //     colors to a square using a given occupancy. Required by SEE to discover
 //     x-ray attackers as pieces are removed from the exchange sequence.
+//
+// Facon 1.7 -- Filo
+//   - Game-history hardening: every history push (make_move,
+//     make_null_move) now goes through push_history(), which compacts the
+//     window when it fills instead of writing past the end of the array.
+//     Previously a "position" move list beyond 512 moves, or a ~450-move
+//     game plus a deep search, silently overflowed history[] (undefined
+//     behavior inside the Board object). MAX_GAME_HISTORY is now a window
+//     size, not a game-length limit; HISTORY_COMPACT_KEEP and a
+//     static_assert tie the kept window to MAX_PLY. Game length is
+//     unlimited.
+//   - Non-ASCII punctuation in comments replaced with ASCII equivalents,
+//     following the convention for touched files.
+//   - Board and StateInfo gained pawn_hash, a Zobrist key over pawn
+//     placement only, maintained by the same helpers that maintain hash.
+//     It keys the pawn-evaluation cache in eval.cpp.
 // =============================================================================
 
 #pragma once
@@ -48,11 +64,30 @@ struct StateInfo {
 
     // Zobrist hash of the position BEFORE this move (for TT and repetition)
     uint64_t hash;
+
+    // Pawn-placement key BEFORE this move (see Board::pawn_hash). Saved and
+    // restored alongside hash, by the same reasoning: the make path touches
+    // it incrementally, so the saved copy is the reversal.
+    uint64_t pawn_hash;
 };
 
-// Maximum number of moves we can store in the history stack.
-// 1024 is more than enough for any real game.
+// Size of the in-Board history window, in plies. This is NOT a game-length
+// limit: when the window fills, push_history() (board.cpp) compacts it by
+// discarding the oldest half, so game length is unbounded. Repetition
+// detection only ever looks back half_move_clock (<= 100) plies and an
+// in-flight search unwinds at most MAX_PLY frames, so the kept half always
+// contains everything either consumer can reach.
 constexpr int MAX_GAME_HISTORY = 1024;
+
+// How many (newest) entries a compaction keeps. Must exceed MAX_PLY plus
+// the 100-ply repetition window, or a compaction in the middle of a deep
+// search could discard entries that unmake_move() still needs. Enforced at
+// compile time so a future MAX_PLY raise cannot silently break the
+// invariant.
+constexpr int HISTORY_COMPACT_KEEP = MAX_GAME_HISTORY / 2;
+static_assert(HISTORY_COMPACT_KEEP > MAX_PLY + 100,
+              "history compaction window too small for MAX_PLY plus the"
+              " repetition scan");
 
 // =============================================================================
 // BOARD
@@ -91,6 +126,15 @@ struct Board {
 
     // Zobrist hash of the current position
     uint64_t hash;
+
+    // Zobrist key covering PAWN PLACEMENT ONLY -- no side to move, no
+    // castling rights, no en passant. Maintained incrementally by the same
+    // three helpers that maintain `hash` (put_piece / remove_piece /
+    // move_piece in board.cpp), which XOR the pawn's piece_square entry
+    // into both keys. Two positions share this key exactly when their pawn
+    // configurations are identical, which is the precondition the pawn
+    // evaluation cache in eval.cpp relies on.
+    uint64_t pawn_hash;
 
     // -------------------------------------------------------------------------
     // HISTORY STACK
@@ -185,6 +229,12 @@ struct Board {
     // MAKE / UNMAKE MOVES
     // -------------------------------------------------------------------------
 
+    // Internal: returns the next free history slot, compacting the window
+    // first when it is full. Every history push (make_move, make_null_move)
+    // goes through here so the array can never overflow. Full analysis at
+    // the definition in board.cpp.
+    StateInfo& push_history();
+
     // Apply a move to the board. Saves irreversible state to the history stack.
     void make_move(Move m);
 
@@ -225,7 +275,7 @@ struct Board {
 // =============================================================================
 // Zobrist hashing assigns a unique random 64-bit number to each (piece, square)
 // combination. The hash of a position is the XOR of all active numbers.
-// Updating the hash after a move requires only a few XOR operations — very fast.
+// Updating the hash after a move requires only a few XOR operations -- very fast.
 // The hash is used by the transposition table and for repetition detection.
 
 namespace Zobrist {

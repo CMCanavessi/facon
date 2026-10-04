@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-06-06 19:54
+// Last modified: 2026-09-18 22:32
 // eval.cpp -- Static position evaluation
 //
 // Implements evaluate(), the function that assigns a static score (in
@@ -194,7 +194,7 @@
 //     is documented in the per-version notes (project rule 3.4).
 //   - Tunable weights centralized into a single flat array.
 //     `eval_weights[NUM_WEIGHTS]` (934 entries) holds every weight the
-//     tuner can adjust. Reads in pawn_structure(), positional_eval(),
+//     calibration can adjust. Reads in pawn_structure(), positional_eval(),
 //     pst_mg_value(), and pst_eg_value() now look up `eval_weights[...]`
 //     instead of the previously-named compile-time constants. All previous
 //     per-weight constexpr (PAWN_ISOLATED_MG, MOBILITY_KNIGHT_MG, etc.) and
@@ -236,13 +236,13 @@
 //
 //     trace_evaluate() and score_from_trace() are not called from search.
 //     Bench signature is preserved bit-for-bit.
-//   - First Texel-tuned weight set integrated. The eval_weights[] initialiser
-//     now holds values produced by Texel tuning on a labeled quiet-position
-//     dataset, instead of the original hand-set values. Material was modelled
+//   - First fitted weight set integrated. The eval_weights[] initialiser
+//     now holds values fitted against a large corpus of labelled quiet
+//     positions, instead of the original hand-set values. Material was modelled
 //     as a separate tunable during tuning and then folded back into the PSTs
 //     (see the big comment on the eval_weights[] definition), so PIECE_VALUE
 //     stays fixed at 100/320/330/500/900 while the evaluation reproduces what
-//     the tuner optimised. This is the first change of the 1.6 cycle that
+//     the fit optimised. This is the first change of the 1.6 cycle that
 //     intentionally alters playing strength, so bench signature changes and
 //     self-play vs the previous dev is expected to show a real Elo delta (the
 //     whole point of the change).
@@ -260,7 +260,7 @@
 //     queen) added once per attacking piece, and an attacker-count bucket
 //     (1, 2, 3, 4+) added once according to how many pieces attack the zone.
 //     The buckets are binary features, so the model stays linear (a hard
-//     requirement for Texel tuning) while still letting the count term grow
+//     requirement for the linear fit) while still letting the count term grow
 //     non-linearly; the 4+ bucket is a structural ceiling, so the unbounded
 //     penalties that sank the earlier hand-set quadratic attempt cannot occur.
 //     The queen's old double-count is dropped -- it is one attacker with its
@@ -271,7 +271,7 @@
 //     other weight. The evaluate() == score_from_trace() bit-exact contract
 //     is preserved (verified on king-attack positions). This alters playing
 //     strength and the bench signature; the weights ship at hand-set seed
-//     values in this dev and are then Texel-tuned (the tuned build is what is
+//     values here and are then fitted (the fitted build is what is
 //     measured by self-play).
 //   - Piece tropism added as a new tunable group (TROPISM, 32 slots appended
 //     at offset 836; NUM_WEIGHTS 836 -> 868). For each knight, bishop, rook
@@ -279,13 +279,15 @@
 //     {1, 2, 3, 4+} and the corresponding (piece, bucket) weight is added.
 //     Bucketing keeps the model linear (required for tuning) while letting the
 //     distance->value curve be non-linear. This reintroduces a feature that
-//     measured neutral when hand-set in 1.5; here it is Texel-tuned. Chebyshev
+//     measured neutral when hand-set in 1.5; here it is fitted. Chebyshev
 //     distance (a new helper) is used deliberately instead of the Manhattan
 //     king_distance() in mopup -- concentric king-pressure rings vs corralling
 //     a lone king, different geometries for different purposes. Folded into the
 //     single evaluate() blend and recorded as trace coefficients, so the
-//     evaluate() == score_from_trace() contract holds (within the documented
-//     <=2cp blend-rounding tolerance). Alters playing strength and the bench
+//     evaluate() == score_from_trace() contract holds to within 3 cp of
+//     blend rounding (evaluate() applied the tapered blend in four places,
+//     the reconstruction in one; integer division does not distribute over
+//     addition). Alters playing strength and the bench
 //     signature; ships at hand-set seeds and is then tuned.
 //   - Pawn shelter/storm added as a new tunable group (SHELTER_STORM, 32 slots
 //     appended at offset 868). Scores the pawns in front of each king as two
@@ -319,6 +321,42 @@
 //     by a friendly pawn). All terms are tapered, folded into the single
 //     evaluate() blend, and recorded as trace coefficients. Each ships at
 //     hand-set seeds and is then tuned.
+//
+// Facon 1.7 -- Filo
+//   - Single-blend evaluation. evaluate() previously applied the tapered
+//     MG/EG blend in four places: the main accumulation plus three helpers
+//     (pawn_structure, positional_eval, positional2) that returned
+//     pre-blended scores. Integer division does not distribute over
+//     addition, so evaluate() and score_from_trace() -- which blends the
+//     summed coefficients once -- could legitimately differ by up to 3 cp
+//     in intermediate phases, and the strict-equality fidelity check in
+//     the "trace" command reported those benign rounding deltas as bugs.
+//     evaluate() now mirrors the EvalTrace decomposition exactly: every
+//     tuned term accumulates raw MG/EG totals, material (phase-independent,
+//     not tuned) accumulates exactly in an additional term outside the
+//     blend, and one blend -- the same expression score_from_trace()
+//     applies -- collapses the poles. evaluate() == score_from_trace()
+//     now holds bit-for-bit by construction, and the strict fidelity check
+//     is correct as written. Alters the bench signature (rounding deltas
+//     of a few cp on mid-phase positions change the search tree).
+//   - All seven eval helpers (king_safety, tropism, shelter_storm,
+//     king_safety_v2, pawn_structure, positional_eval, positional2) are now
+//     raw extractors: void functions filling MG/EG out-parameters, no
+//     phase parameter, no internal blend. The only tapered blend in the
+//     evaluation path lives in evaluate(). evaluate_verbose() blends
+//     locally for its per-component display rows and recomputes its total
+//     with the evaluate() expression, so the displayed total is now
+//     bit-exact as well.
+//   - pawn_structure() split into a pure computation
+//     (pawn_structure_compute) and a caching wrapper keyed by
+//     Board::pawn_hash. The cached values are bit-identical to the
+//     computed ones, so the bench fingerprint must NOT move. Compiled out
+//     of the calibration build via FACON_NO_PAWN_CACHE.
+//   - Threat evaluation: six attacker/victim families counted from the
+//     attack maps the mobility sweep already builds, in both
+//     positional_eval() and the parallel walk in trace_evaluate(). The
+//     counting itself lives in one shared function so the two paths cannot
+//     disagree about what a threat is.
 // =============================================================================
 
 #include "eval.h"
@@ -373,83 +411,86 @@
 
 int eval_weights[NUM_WEIGHTS] = {
 // ---- PAWN_STRUCT (offsets 0..15): 4 used + 4 reserved padding ----
-      -10,   -9,     -3,  -21,      0,   -5,     11,    9,      0,    0,      0,    0,      0,    0,      0,    0,
+      -10,   -9,     -4,  -21,      1,   -5,     12,    9,      0,    0,      0,    0,      0,    0,      0,    0,
 // ---- PASSED_BONUS (offsets 16..31): by rank (ranks 0 and 7 unreachable=0) ----
-        0,    0,    -24,  -37,    -36,  -21,    -32,   16,     -2,   55,      0,  132,     40,  171,      0,    0,
+        0,    0,    -26,  -37,    -38,  -22,    -37,   16,     -10,   56,      -10,  132,     27,  173,      0,    0,
 // ---- MOBILITY (offsets 32..39) ----
-        7,    4,      7,    4,      3,    3,      4,    1,
+        7,    4,      7,    5,      3,    4,      4,    1,
 // ---- ROOK_BONUSES (offsets 40..45) ----
-       38,    4,     14,   14,     -1,   37,
+       36,    3,     14,   13,     -3,   36,
 // ---- BISHOP_PAIR (offsets 46..47) ----
-       24,   74,
+       24,   72,
 // ---- KNIGHT_OUTPOST (offsets 48..51) ----
-       35,   -9,     49,   27,
+       19,   -14,     38,   19,
 // ---- PST_PAWN (offsets 52..179) -- material folded in ----
-      -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,
-      -42,   34,    -36,   31,    -29,   25,    -36,   20,    -20,   32,    -10,   23,      2,   13,    -34,   11,
-      -48,   29,    -40,   25,    -33,   19,    -27,   20,    -18,   19,    -22,   19,    -11,   12,    -26,    9,
-      -38,   36,    -36,   35,    -20,   19,     -7,   11,     -2,   10,     -8,   16,    -17,   22,    -26,   16,
-      -32,   56,    -19,   44,    -16,   30,     -9,   12,     16,    9,      2,   20,     -3,   33,    -21,   31,
-       -8,   77,    -12,   82,     24,   44,     29,   10,     48,    3,     65,   26,     32,   62,    -11,   66,
-       25,  100,     46,   85,     21,   98,     57,   48,     42,   49,     19,   69,    -33,   99,    -75,  118,
-      -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,    -17,   14,
+      -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,
+      -42,   33,    -36,   30,    -28,   23,    -36,   18,    -20,   31,     -9,   22,      1,   12,    -35,   11,
+      -50,   29,    -43,   25,    -35,   18,    -32,   20,    -21,   19,    -25,   18,    -14,   11,    -29,    9,
+      -40,   36,    -41,   35,    -25,   19,     -14,   11,     -10,   10,     -12,   15,    -23,   22,    -28,   15,
+      -34,   55,    -24,   44,    -20,   29,     -16,   13,      6,    10,      -3,   20,     -9,   33,    -23,   30,
+       -9,   76,    -19,   82,     13,   45,     20,   11,     34,    5,     55,   27,     26,   62,    -13,   65,
+       25,   97,     31,   87,     15,   98,     52,   48,     30,   51,     21,   67,    -47,   101,    -71,  115,
+      -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,    -20,   13,
 // ---- PST_KNIGHT (offsets 180..307) ----
-       -1,    9,     39,    3,     42,   27,     60,   28,     64,   29,     70,   17,     43,   13,     36,    3,
-       34,   15,     47,   28,     61,   38,     78,   36,     80,   35,     75,   34,     72,   18,     67,   27,
-       39,   24,     62,   39,     68,   47,     80,   59,     97,   57,     79,   41,     85,   34,     64,   27,
-       45,   37,     60,   48,     79,   61,     80,   59,     93,   65,     92,   55,     92,   43,     67,   28,
-       41,   51,     56,   55,     75,   64,     76,   69,     74,   73,     94,   63,     66,   62,     68,   40,
-       31,   44,     58,   49,     62,   61,     64,   70,     96,   60,     88,   45,     59,   44,     22,   37,
-       42,   29,     74,   38,     94,   42,     99,   45,     64,   44,    125,   32,     46,   44,     61,    9,
-      -97,  -47,    -67,   19,    -26,   45,     16,   33,     43,   40,    -25,   18,    -73,   28,    -55,  -70,
+        0,    8,     38,    3,     44,   25,     61,   26,     65,   27,     71,   15,     43,   12,     39,    1,
+       35,   13,     48,   28,     62,   37,     78,   34,     80,   33,     77,   32,     73,   16,     68,   24,
+       41,   23,     66,   38,     72,   45,     84,   57,     100,   54,     84,   39,     89,   33,     67,   26,
+       52,   43,     72,   51,     86,   64,     92,   62,     101,   68,     100,   57,     103,   46,     76,   31,
+       56,   55,     73,   59,     90,   67,     86,   74,     82,   78,     110,   65,     85,   64,     84,   44,
+       39,   49,     58,   55,     60,   69,     69,   74,     77,   73,     92,   51,     56,   52,     39,   41,
+       34,   30,     56,   42,     57,   50,     67,   52,     57,   44,     77,   41,     37,   44,     46,    12,
+      -92,  -47,    -60,   18,    -30,   46,     11,   33,     38,   41,    -27,   19,    -71,   28,    -56,  -68,
 // ---- PST_BISHOP (offsets 308..435) ----
-       74,    0,     96,   23,     74,    9,     72,   17,     80,   15,     70,   22,     89,    6,     99,  -23,
-       82,   15,     87,    8,     98,    8,     77,   21,     89,   22,     97,   16,    110,   14,     93,   -5,
-       68,   16,     89,   30,     88,   30,     84,   34,     88,   42,     91,   33,     92,   24,     93,    8,
-       59,   16,     54,   27,     70,   33,     92,   28,     90,   29,     71,   33,     70,   31,     81,    3,
-       36,   29,     66,   31,     57,   30,     66,   45,     73,   33,     61,   39,     65,   33,     32,   38,
-       39,   38,     47,   30,     47,   37,     38,   33,     29,   40,     62,   42,     45,   40,     29,   46,
-       54,   22,     82,   27,     64,   34,     47,   45,     50,   36,     49,   40,     55,   37,     25,   30,
-       36,   33,     16,   39,     17,   37,    -31,   51,    -38,   55,    -19,   36,     29,   33,      2,   21,
+       78,    -2,     98,   22,     75,    8,     75,   16,     82,   13,     72,   21,     91,    4,     104,  -26,
+       84,   13,     89,    6,     101,    7,     80,   20,     92,   20,     100,   14,    111,   12,     94,   -7,
+       68,   15,     96,   27,     93,   28,     90,   32,     93,   39,     97,   30,     96,   21,     96,    6,
+       71,   19,     62,   30,     80,   34,     105,   29,     99,   30,     82,   33,     78,   32,     92,    5,
+       52,   32,     88,   32,     71,   33,     81,   46,     82,   37,     81,   40,     84,   35,     51,   40,
+       59,   40,     60,   33,     55,   39,     44,   37,     45,   40,     77,   44,     63,   41,     48,   48,
+       50,   22,     53,   32,     55,   33,     34,   45,     18,   40,     40,   39,     20,   42,     15,   32,
+       43,   30,     20,   37,     20,   35,    -33,   50,    -39,   53,    -18,   34,     26,   32,      3,   19,
 // ---- PST_ROOK (offsets 436..563) ----
-       21,  157,     25,  155,     29,  162,     39,  152,     45,  146,     41,  150,     42,  146,     28,  141,
-        5,  157,     10,  162,     24,  162,     29,  158,     33,  152,     39,  147,     58,  137,     21,  141,
-        2,  169,      6,  168,     11,  167,     14,  167,     24,  161,     27,  156,     58,  139,     35,  141,
-        1,  181,      1,  183,     11,  181,     18,  177,     16,  177,      6,  178,     32,  169,     17,  167,
-        5,  194,     22,  188,     20,  195,     18,  192,     10,  183,     23,  180,     25,  185,     15,  180,
-        7,  194,     38,  189,     33,  192,     18,  192,     35,  187,     40,  183,     76,  177,     31,  177,
-       19,  160,     19,  170,     38,  171,     41,  165,      3,  174,     53,  159,     44,  155,     61,  145,
-       27,  189,     31,  190,     26,  198,     16,  196,     14,  194,     38,  194,     42,  194,     49,  189,
+       20,  155,     26,  153,     31,  159,     40,  150,     46,  143,     41,  147,     43,  143,     27,  139,
+        8,  154,     13,  160,     27,  159,     31,  156,     36,  149,     42,  144,     61,  134,     22,  139,
+        5,  167,      10,  167,     17,  164,     20,  164,     30,  158,     32,  154,     64,  137,     38,  139,
+        4,  179,      9,  180,     18,  178,     26,  175,     23,  174,      16,  175,     42,  166,     23,  165,
+        11,  191,     32,  184,     30,  191,     20,  190,     19,  181,     36,  175,     39,  181,     23,  177,
+        10,  191,     41,  186,     33,  190,     17,  190,     33,  185,     44,  180,     81,  174,     35,  174,
+       22,  157,     23,  167,     39,  169,     39,  164,      3,  172,     52,  158,     48,  152,     64,  143,
+       29,  186,     32,  187,     26,  196,     17,  193,     12,  193,     35,  192,     38,  193,     50,  186,
 // ---- PST_QUEEN (offsets 564..691) ----
-      193,  353,    199,  354,    206,  359,    208,  368,    211,  354,    196,  357,    208,  339,    203,  334,
-      202,  355,    203,  365,    207,  371,    214,  374,    212,  378,    219,  356,    226,  326,    234,  304,
-      193,  368,    197,  397,    196,  411,    194,  406,    199,  413,    205,  404,    219,  385,    214,  374,
-      191,  385,    183,  417,    188,  420,    196,  427,    198,  411,    195,  412,    204,  403,    212,  396,
-      176,  404,    182,  417,    184,  417,    169,  430,    165,  429,    182,  413,    181,  423,    185,  408,
-      186,  399,    180,  409,    177,  434,    165,  434,    157,  446,    184,  427,    189,  402,    184,  407,
-      171,  402,    161,  419,    162,  447,    129,  463,     90,  493,    158,  435,    151,  443,    202,  410,
-      136,  414,    152,  409,    168,  426,    186,  417,    156,  422,    160,  425,    213,  367,    149,  412,
+      190,  351,    199,  349,    206,  355,    206,  366,    210,  351,    196,  353,    206,  338,    202,  333,
+      202,  353,    202,  363,    206,  369,    212,  371,    211,  376,    219,  353,    227,  323,    234,  300,
+      195,  364,    200,  396,    199,  407,    196,  404,    201,  410,    208,  400,    223,  382,    216,  371,
+      194,  382,    192,  410,    194,  415,    203,  421,    204,  406,    203,  409,    214,  400,    218,  395,
+      184,  399,    197,  407,    197,  407,    173,  424,    173,  426,    194,  409,    196,  419,    197,  401,
+      189,  394,    183,  403,    178,  429,    161,  433,    154,  443,    182,  424,    193,  397,    183,  403,
+      174,  397,    162,  417,    164,  442,    127,  459,     90,  486,    157,  433,    146,  444,    202,  408,
+      147,  405,    165,  398,    181,  415,    191,  408,    160,  415,    165,  419,    223,  358,    164,  399,
 // ---- PST_KING (offsets 692..819) -- no material fold (king=0) ----
-       14,  -80,     38,  -56,     31,  -35,    -38,  -13,     13,  -38,    -28,  -20,     20,  -50,     22,  -92,
-       38,  -56,      4,  -20,      8,   -9,     -9,   -2,    -14,    1,     -7,   -8,     13,  -24,     18,  -50,
-      -34,  -40,     -2,  -15,    -31,    3,    -26,   12,    -18,   10,    -35,    5,    -18,  -11,    -53,  -26,
-      -56,  -38,    -27,  -10,    -47,   14,    -88,   30,    -79,   28,    -51,   12,    -69,    3,   -139,   -9,
-      -44,  -26,    -12,   -1,    -41,   21,    -90,   36,    -88,   34,    -66,   29,    -66,   16,   -141,    6,
-      -74,  -11,     73,    1,     17,   20,    -23,   34,     25,   33,     82,   19,     21,   22,    -20,   -4,
-      -64,  -16,     18,   10,      1,   19,    109,   -1,     41,   14,     31,   31,     43,   22,    -29,    2,
-      108, -113,    122,  -62,    108,  -42,     -2,   -1,     24,  -20,    -12,   -6,     44,  -16,    185, -133,
+       12,  -80,     37,  -56,     29,  -33,    -38,  -12,     11,  -37,    -28,  -20,     17,  -49,     20,  -92,
+       36,  -56,      3,  -20,      7,   -9,     -10,   -2,    -15,    1,     -8,   -8,     12,  -24,     17,  -50,
+      -36,  -40,     -2,  -15,    -30,    3,    -23,   12,    -17,    9,    -32,    4,    -17,  -11,    -52,  -27,
+      -54,  -38,    -25,  -10,    -43,   13,    -83,   29,    -75,   27,    -47,   11,    -66,    2,   -136,   -10,
+      -41,  -26,     -9,   -1,    -36,   21,    -85,   36,    -82,   33,    -60,   28,    -61,   16,   -136,    5,
+      -73,  -12,     76,    1,     18,   20,    -20,   33,     31,   32,     87,   19,     25,   21,    -17,   -5,
+      -66,  -16,     18,    9,      4,   18,    110,   -2,     44,   13,     34,   30,     45,   22,    -30,    1,
+      107, -112,    119,  -62,    110,  -43,     -3,   -1,     24,  -20,    -12,   -6,     44,  -16,    180, -132,
 // ---- KING_SAFETY (offsets 820..835): linear king-safety terms ----
-       -7,    8,    -31,   -6,    -32,   10,    -19,  -19,     24,    2,     18,    0,    -22,   -9,   -126,   43,
+       -9,    8,    -32,   -7,    -35,   11,    -20,  -20,     26,    1,     20,    1,    -20,   -6,   -121,   51,
 // ---- TROPISM (offsets 836..867): piece proximity to enemy king ----
-      -21,   26,    -15,   41,    -37,   62,    -69,   62,    -56,   22,    -35,   48,    -56,   57,    -72,   71,
-      -18,   76,    -34,   86,    -62,   95,    -84,  105,      8,    0,    -31,  142,    -93,  147,   -118,  131,
+      -10,   32,    -10,   41,    -35,   62,    -69,   63,    -41,   24,    -28,   46,    -53,   56,    -72,   71,
+      -22,   84,    -30,   83,    -58,   92,    -83,  102,      8,    0,    -29,  139,    -89,  144,   -120,  129,
 // ---- SHELTER_STORM (offsets 868..899): pawn shelter/storm ----
-       24,   -4,     11,    2,      0,   -5,    -10,    2,     14,    1,      1,    6,     -2,   -1,     -2,   -3,
-       87,    9,    -11,  -21,     15,  -15,     22,  -19,      4,   27,    -21,  -12,     -4,  -15,     11,  -16,
+       24,   -4,     11,    2,      -1,   -5,    -10,    2,     14,    1,      1,    6,     -2,   -1,     -3,   -3,
+       79,    10,    -10,  -20,     14,  -15,     22,  -19,      1,   28,    -22,  -12,     -4,  -15,     11,  -16,
 // ---- KING_SAFETY_V2 (offsets 900..915): open files + safe checks ----
-      -41,  -10,    -20,   -7,    -18,   21,    -20,   23,   -110,   -4,    -40,  -22,   -106,    9,    -42,  -74,
+      -41,  -11,    -19,   -7,    -18,   21,    -19,   23,   -106,   -5,    -39,  -22,   -102,    8,    -40,  -74,
 // ---- POSITIONAL2 (offsets 916..933): tempo + bishop-outpost + passer refinement ----
-       23,   29,     30,   -1,     56,   15,      5,  -10,      1,   13,    -22,  -50,     -9,  -10,    -19,   26,     15,    7
+       33,   30,     10,   -4,     41,    9,      5,  -10,      2,   13,    -13,  -52,      1,  -14,    -20,   27,     14,    7,
+// ---- THREAT (offsets 934..945): hand seeds, measured raw before any tuning ----
+// pawn-on-minor, pawn-on-major, minor-on-major, rook-on-queen, hanging, pawn-push
+       70,   28,     83,   -7,     61,    9,     72,   -2,     23,   22,     22,    5
 };
 
 
@@ -575,8 +616,8 @@ static int pst_eg_value(PieceType pt, Color c, Square sq) {
 //   SCALE, where each attacking piece type added a hand-set weight to
 //   total_weight. The quadratic captured a real effect -- two or three
 //   coordinating attackers are far more dangerous than one -- but it could
-//   not be Texel-tuned, because the tuner optimises a strictly linear model
-//   (a w^2 term has a weight-dependent gradient the tuner does not compute).
+//   not be fitted, because the fitting process optimises a strictly linear model
+//   (a w^2 term has a weight-dependent gradient the fit does not compute).
 //   Hand-setting those constants is exactly what failed at this strength
 //   level previously.
 //
@@ -589,7 +630,7 @@ static int pst_eg_value(PieceType pt, Color c, Square sq) {
 //
 //     (b) Attacker-count bucket: add one weight chosen by how many distinct
 //         pieces attack the zone -- bucket 1, 2, 3, or 4-or-more. Each bucket
-//         is selected by the count, so the tuner can make three attackers
+//         is selected by the count, so the fit can make three attackers
 //         cost much more than three times one attacker, recovering the
 //         non-linear "coordination" effect. Crucially the 4+ bucket is a hard
 //         ceiling: there is no way to produce the unbounded penalties that
@@ -609,7 +650,7 @@ static int pst_eg_value(PieceType pt, Color c, Square sq) {
 
 // king_zone_attackers: shared counting routine, the single source of truth for
 // both king_safety() (which turns counts into a score) and trace_evaluate()
-// (which turns the same counts into tuner coefficients). Keeping one routine
+// (which turns the same counts into linear coefficients). Keeping one routine
 // guarantees the traced coefficients reproduce the score exactly.
 //
 // Fills counts[KNIGHT..QUEEN] with how many enemy pieces of each type attack
@@ -681,17 +722,15 @@ static inline int count_bucket_offset(int count) {
 
 // king_safety: computes one king's safety penalty. Fills `mg_out` and `eg_out`
 // with the RAW (un-blended) middlegame and endgame penalties -- the sums of the
-// tunable weights -- and also returns the phase-blended value for callers that
-// want a single number (evaluate_verbose). evaluate() uses the raw outputs and
-// folds them into its single end-of-function blend, so that evaluate() and
-// score_from_trace() perform the exact same number of integer divisions and
-// agree bit-for-bit (no per-term rounding drift).
+// tunable weights. The single tapered blend lives in evaluate(), which folds
+// the raw outputs into its accumulators so that evaluate() and
+// score_from_trace() perform the exact same arithmetic.
 //
 // Raw values are negative (penalties); the sign that makes a penalty reduce
 // `us`'s score is applied by the caller (evaluate adds White's and subtracts
 // Black's), matching the rest of the eval's White-relative convention.
-static Score king_safety(const Board& board, Color us, int phase_mg,
-                         int& mg_out, int& eg_out) {
+static void king_safety(const Board& board, Color us,
+                        int& mg_out, int& eg_out) {
     KingZoneAttackers a = king_zone_attackers(board, us);
 
     mg_out = 0;
@@ -699,7 +738,7 @@ static Score king_safety(const Board& board, Color us, int phase_mg,
 
     // No attackers: no penalty in either phase. (Also the common case, so it
     // is cheap to short-circuit.)
-    if (a.total == 0) return 0;
+    if (a.total == 0) return;
 
     const int* w = &eval_weights[KING_SAFETY_START];
 
@@ -722,9 +761,6 @@ static Score king_safety(const Board& board, Color us, int phase_mg,
 
     mg_out = mg;
     eg_out = eg;
-
-    // Phase-blended value (for verbose display only).
-    return Score((mg * phase_mg + eg * (256 - phase_mg)) / 256);
 }
 
 // =============================================================================
@@ -737,8 +773,8 @@ static Score king_safety(const Board& board, Color us, int phase_mg,
 // For each of your knights, bishops, rooks and queens, we take the Chebyshev
 // distance to the enemy king and bucket it into {1, 2, 3, 4-or-more}. Each
 // (piece type, bucket) pair has its own tunable (MG, EG) weight. Bucketing
-// keeps the model linear in the weights -- a hard requirement for Texel tuning
-// -- while letting the distance->value relationship be non-linear: the tuner
+// keeps the model linear in the weights -- a hard requirement for the fit
+// -- while letting the distance->value relationship be non-linear: the fit
 // can make a queen adjacent to the king worth far more than one three squares
 // out, rather than forcing a straight line. The 4+ bucket lumps together every
 // piece far enough to exert little king pressure.
@@ -769,7 +805,7 @@ static inline int tropism_bucket(int dist) {
 
 // tropism_counts: shared counting routine, the single source of truth for both
 // tropism() (which turns counts into a score) and trace_evaluate() (which turns
-// the same counts into tuner coefficients). For the side `us`, fills a 4x4
+// the same counts into linear coefficients). For the side `us`, fills a 4x4
 // matrix counts[piece_index][bucket] where piece_index is 0..3 for
 // {knight, bishop, rook, queen}, counting how many of that piece type sit at
 // each Chebyshev-distance bucket from the enemy king.
@@ -794,12 +830,11 @@ static inline TropismCounts tropism_counts(const Board& board, Color us) {
 }
 
 // tropism: computes one side's tropism bonus. Fills raw (un-blended) MG and EG
-// sums and returns the phase-blended value (for verbose display). evaluate()
-// uses the raw outputs and folds them into its single blend so evaluate() and
-// score_from_trace() stay bit-identical. The sign that makes this a bonus for
+// sums. The single tapered blend lives in evaluate(), which folds the raw
+// outputs into its accumulators. The sign that makes this a bonus for
 // `us` is applied by the caller (evaluate adds White's, subtracts Black's).
-static Score tropism(const Board& board, Color us, int phase_mg,
-                     int& mg_out, int& eg_out) {
+static void tropism(const Board& board, Color us,
+                    int& mg_out, int& eg_out) {
     TropismCounts tc = tropism_counts(board, us);
     const int* w = &eval_weights[TROPISM_START];
 
@@ -817,7 +852,6 @@ static Score tropism(const Board& board, Color us, int phase_mg,
 
     mg_out = mg;
     eg_out = eg;
-    return Score((mg * phase_mg + eg * (256 - phase_mg)) / 256);
 }
 
 // =============================================================================
@@ -835,7 +869,7 @@ static Score tropism(const Board& board, Color us, int phase_mg,
 //
 // Distance is the rank gap between the relevant pawn and the king, bucketed
 // {1, 2, 3, 4+} -- the same linear-in-weights bucketing used by tropism, so
-// the tuner can give each ring its own value. The king's own file is scored
+// the fit can give each ring its own value. The king's own file is scored
 // with its own weights; the two adjacent files share a second set (the king
 // file is the more critical, but distinguishing both adjacent files
 // separately would only add weights for little signal).
@@ -920,12 +954,11 @@ static inline ShelterStormCounts shelter_storm_counts(const Board& board, Color 
 }
 
 // shelter_storm: one side's shelter/storm score. Fills raw (un-blended) MG and
-// EG and returns the phase-blended value (verbose display only). evaluate()
-// uses the raw outputs and folds them into its single blend so evaluate() and
-// score_from_trace() stay bit-identical. Sign is applied by the caller
+// EG. The single tapered blend lives in evaluate(), which folds the raw
+// outputs into its accumulators. Sign is applied by the caller
 // (evaluate adds White's, subtracts Black's).
-static Score shelter_storm(const Board& board, Color us, int phase_mg,
-                           int& mg_out, int& eg_out) {
+static void shelter_storm(const Board& board, Color us,
+                          int& mg_out, int& eg_out) {
     ShelterStormCounts sc = shelter_storm_counts(board, us);
     const int* w = &eval_weights[SHELTER_STORM_START];
 
@@ -956,7 +989,6 @@ static Score shelter_storm(const Board& board, Color us, int phase_mg,
 
     mg_out = mg;
     eg_out = eg;
-    return Score((mg * phase_mg + eg * (256 - phase_mg)) / 256);
 }
 
 // =============================================================================
@@ -1063,11 +1095,10 @@ static inline KingSafetyV2Counts king_safety_v2_counts(const Board& board, Color
     return c;
 }
 
-// king_safety_v2: one king's open-file + safe-check penalty. Fills raw MG/EG
-// and returns the blended value (verbose only). evaluate() uses the raw outputs
-// and folds them into its single blend; sign applied by the caller.
-static Score king_safety_v2(const Board& board, Color us, int phase_mg,
-                            int& mg_out, int& eg_out) {
+// king_safety_v2: one king's open-file + safe-check penalty. Fills raw MG/EG;
+// the single tapered blend lives in evaluate(). Sign applied by the caller.
+static void king_safety_v2(const Board& board, Color us,
+                           int& mg_out, int& eg_out) {
     KingSafetyV2Counts c = king_safety_v2_counts(board, us);
     const int* w = &eval_weights[KING_SAFETY_V2_START];
 
@@ -1095,7 +1126,6 @@ static Score king_safety_v2(const Board& board, Color us, int phase_mg,
 
     mg_out = mg;
     eg_out = eg;
-    return Score((mg * phase_mg + eg * (256 - phase_mg)) / 256);
 }
 
 // Flood-fill a bitboard toward each promotion edge. Used by passed-pawn
@@ -1234,8 +1264,115 @@ static inline Positional2Counts positional2_counts(const Board& board, Color stm
     return c;
 }
 
-static Score positional2(const Board& board, Color stm, int phase_mg,
-                         int& mg_out, int& eg_out) {
+// =============================================================================
+// THREAT EVALUATION (1.7)
+// =============================================================================
+// What is attacked, and by what. Broken down by attacker type and victim
+// class rather than collapsed into one generic term, because the families
+// mean different things: a pawn hitting a knight usually wins material or a
+// tempo outright, a rook hitting a queen mostly gains time, and a piece that
+// is attacked and undefended is a different problem from one merely attacked.
+// Counted from White's perspective as (white - black), like every other
+// counts helper here.
+//
+// The attack maps this needs are the ones the mobility sweep already
+// generates, so the maps are accumulated THERE -- once in positional_eval()
+// and once in the parallel walk inside trace_evaluate() -- and handed to the
+// shared counting function below. A standalone second sweep was measured
+// first and cost about 10% NPS; folding into the existing sweep keeps the
+// same six terms for a fraction of that. Only the `|=` accumulation lines
+// are duplicated across the two paths (exactly as the mobility counts
+// themselves already are); every decision about which bitboard intersects
+// which lives here, in one place, and the "trace" command's fidelity check
+// verifies the two paths still agree.
+struct ThreatCounts {
+    int pawn_on_minor;   // enemy minors attacked by our pawns          (W-B)
+    int pawn_on_major;   // enemy majors attacked by our pawns          (W-B)
+    int minor_on_major;  // enemy majors attacked by our minors         (W-B)
+    int rook_on_queen;   // enemy queens attacked by our rooks          (W-B)
+    int hanging;         // enemy pieces we attack that are undefended  (W-B)
+    int pawn_push;       // safe pawn pushes that would create a threat (W-B)
+};
+
+// Indexed [WHITE] / [BLACK]. pawn_atk / minor_atk / rook_atk are the unions
+// of that side's pawn, minor (knight+bishop) and rook attack sets; all_atk
+// is everything that side attacks, kings and queens included.
+static inline void threat_counts_from_maps(const Board& board,
+                                           const Bitboard pawn_atk[2],
+                                           const Bitboard minor_atk[2],
+                                           const Bitboard rook_atk[2],
+                                           const Bitboard all_atk[2],
+                                           ThreatCounts& c) {
+    const Bitboard occ = board.occupancy();
+
+    // Per-colour piece sets, built once instead of once per loop iteration:
+    // the loop below needs both sides' sets, so computing them inside would
+    // do the same work twice.
+    Bitboard pawns[2], queens[2], minors[2], majors[2], loose[2];
+    for (int ci = WHITE; ci <= BLACK; ci++) {
+        Color cc  = Color(ci);
+        pawns[ci]  = board.piece_bb(cc, PAWN);
+        queens[ci] = board.piece_bb(cc, QUEEN);
+        minors[ci] = board.piece_bb(cc, KNIGHT) | board.piece_bb(cc, BISHOP);
+        majors[ci] = board.piece_bb(cc, ROOK)   | queens[ci];
+        // Material that can actually hang: no pawns (too cheap to matter as
+        // a threat target here) and no king (an attacked king is check).
+        loose[ci]  = minors[ci] | majors[ci];
+    }
+
+    for (int ci = WHITE; ci <= BLACK; ci++) {
+        Color us   = Color(ci);
+        int   s    = (us == WHITE) ? +1 : -1;
+        int   ti   = ci ^ 1;   // the other side's index
+
+        Bitboard enemy_minors = minors[ti];
+        Bitboard enemy_majors = majors[ti];
+        Bitboard enemy_queens = queens[ti];
+
+        c.pawn_on_minor  += s * popcount(pawn_atk[ci]  & enemy_minors);
+        c.pawn_on_major  += s * popcount(pawn_atk[ci]  & enemy_majors);
+        c.minor_on_major += s * popcount(minor_atk[ci] & enemy_majors);
+        c.rook_on_queen  += s * popcount(rook_atk[ci]  & enemy_queens);
+
+        // Hanging: enemy minors and majors we attack and they do not defend.
+        // Pawns and the king are out by construction of loose[] above.
+        c.hanging += s * popcount(loose[ti] & all_atk[ci] & ~all_atk[ti]);
+
+        // Pawn pushes that would create a threat: advance one square to an
+        // empty square no enemy pawn attacks, and count the enemy pieces the
+        // pawn would attack from there.
+        Bitboard pushes = (us == WHITE) ? shift_north(pawns[ci])
+                                        : shift_south(pawns[ci]);
+        pushes &= ~occ;
+        pushes &= ~pawn_atk[ti];
+        Bitboard push_threats = pawn_attacks_bb(us, pushes)
+                              & (enemy_minors | enemy_majors);
+        c.pawn_push += s * popcount(push_threats);
+    }
+}
+
+static void threats_from_counts(const ThreatCounts& c,
+                                int& mg_out, int& eg_out) {
+    const int* w = &eval_weights[THREAT_START];
+    int mg = 0, eg = 0;
+    mg += c.pawn_on_minor  * w[W_THREAT_PAWN_ON_MINOR_MG];
+    eg += c.pawn_on_minor  * w[W_THREAT_PAWN_ON_MINOR_EG];
+    mg += c.pawn_on_major  * w[W_THREAT_PAWN_ON_MAJOR_MG];
+    eg += c.pawn_on_major  * w[W_THREAT_PAWN_ON_MAJOR_EG];
+    mg += c.minor_on_major * w[W_THREAT_MINOR_ON_MAJOR_MG];
+    eg += c.minor_on_major * w[W_THREAT_MINOR_ON_MAJOR_EG];
+    mg += c.rook_on_queen  * w[W_THREAT_ROOK_ON_QUEEN_MG];
+    eg += c.rook_on_queen  * w[W_THREAT_ROOK_ON_QUEEN_EG];
+    mg += c.hanging        * w[W_THREAT_HANGING_MG];
+    eg += c.hanging        * w[W_THREAT_HANGING_EG];
+    mg += c.pawn_push      * w[W_THREAT_PAWN_PUSH_MG];
+    eg += c.pawn_push      * w[W_THREAT_PAWN_PUSH_EG];
+    mg_out = mg;
+    eg_out = eg;
+}
+
+static void positional2(const Board& board, Color stm,
+                        int& mg_out, int& eg_out) {
     Positional2Counts c = positional2_counts(board, stm);
     const int* w = &eval_weights[POSITIONAL2_START];
     int mg = 0, eg = 0;
@@ -1259,7 +1396,6 @@ static Score positional2(const Board& board, Color stm, int phase_mg,
     eg += c.passer_protected     * w[W_POS2_PASSER_PROTECTED_EG];
     mg_out = mg;
     eg_out = eg;
-    return Score((mg * phase_mg + eg * (256 - phase_mg)) / 256);
 }
 
 // =============================================================================
@@ -1316,6 +1452,91 @@ static int king_distance(Square a, Square b) {
          + std::abs(rank_of(a) - rank_of(b));
 }
 
+// True when `side` has no way to force checkmate against a lone king, no
+// matter how the game goes: bare king, king and one minor, king and two
+// knights, or king and two bishops that share a square colour. Opposite-
+// coloured bishops DO mate, so they are excluded.
+//
+// One definition, three consumers: the mopup guard below, the endgame
+// scaling that follows it, and the explanatory branch in evaluate_verbose().
+// Those used to carry three copies of the same conditions.
+static bool cannot_force_mate(const Board& board, Color side) {
+    if (board.piece_bb(side, PAWN) || board.piece_bb(side, ROOK)
+        || board.piece_bb(side, QUEEN))
+        return false;
+
+    Bitboard knights = board.piece_bb(side, KNIGHT);
+    Bitboard bishops = board.piece_bb(side, BISHOP);
+    int n = popcount(knights);
+    int b = popcount(bishops);
+
+    if (n + b <= 1) return true;        // K, K+N, K+B
+    if (b == 0 && n == 2) return true;  // K+N+N -- drawn against best defence
+
+    if (n == 0 && b == 2) {             // K+B+B -- drawn only on one colour
+        Bitboard copy = bishops;
+        Square s1 = pop_lsb(copy);
+        Square s2 = pop_lsb(copy);
+        return ((file_of(s1) + rank_of(s1)) & 1)
+            == ((file_of(s2) + rank_of(s2)) & 1);
+    }
+    return false;                        // KBN, KRK, KQK, three minors, ...
+}
+
+// =============================================================================
+// ENDGAME SCALING
+// =============================================================================
+// Material signatures the engine should not treat at face value. Facon knows
+// how to stop CHASING in a drawn pawnless ending (the mopup guard below
+// returns no bonus there), but until now it still scored KB vs K at the full
+// value of the bishop -- about +330 -- so it believed it was winning a dead
+// draw, and would decline repetitions it should have taken.
+//
+// The fix is a multiplicative scale on the final score, never a clamp. See
+// the SCALE_* constants in eval.h for why none of them is zero.
+//
+// `strong` is the side the score currently favours, exactly as mopup picks
+// it: from the sign of the score so far.
+static int endgame_scale(const Board& board, Color strong) {
+    // 1. The side that is ahead cannot force mate at all. This is the case
+    //    that motivated the whole term.
+    if (cannot_force_mate(board, strong))
+        return SCALE_DRAWN;
+
+    Color weak = ~strong;
+
+    // 2. Rook against a single minor with no pawns anywhere: a theoretical
+    //    draw with correct defence, though it is won often enough in
+    //    practice that the score should shrink rather than vanish.
+    if (board.piece_bb(PAWN) == 0
+        && popcount(board.all_pieces(strong)) == 2
+        && board.piece_bb(strong, ROOK)
+        && popcount(board.all_pieces(weak)) == 2
+        && (board.piece_bb(weak, KNIGHT) || board.piece_bb(weak, BISHOP)))
+        return SCALE_DRAWISH;
+
+    // 3. Opposite-coloured bishops and nothing else but pawns, with at most
+    //    a one-pawn difference. The classic drawn-but-not-dead ending: the
+    //    defending bishop covers squares the attacking one can never touch.
+    //    Deliberately narrow -- a larger pawn edge often does win, and this
+    //    is the first attempt at this family.
+    if (board.piece_bb(KNIGHT) == 0 && board.piece_bb(ROOK) == 0
+        && board.piece_bb(QUEEN) == 0
+        && popcount(board.piece_bb(WHITE, BISHOP)) == 1
+        && popcount(board.piece_bb(BLACK, BISHOP)) == 1) {
+        Square ws = lsb(board.piece_bb(WHITE, BISHOP));
+        Square bs = lsb(board.piece_bb(BLACK, BISHOP));
+        bool opposite = (((file_of(ws) + rank_of(ws)) & 1)
+                      != ((file_of(bs) + rank_of(bs)) & 1));
+        int pawn_diff = std::abs(popcount(board.piece_bb(WHITE, PAWN))
+                               - popcount(board.piece_bb(BLACK, PAWN)));
+        if (opposite && pawn_diff <= 1)
+            return SCALE_OCB;
+    }
+
+    return SCALE_NORMAL;
+}
+
 // Returns the mopup bonus in centipawns from White's perspective.
 // strong_side: the side with the material advantage.
 // weak_side:   the side being mated.
@@ -1334,42 +1555,10 @@ static Score mopup_eval(const Board& board, Color strong_side) {
     //   K + N+N vs K          (two knights, 640cp -- drawn against optimal play)
     //   K + B+B vs K          ONLY when both bishops occupy same-colored squares
     //                         (660cp -- drawn; opposite-colored bishops do mate)
-    Bitboard strong_pieces = board.all_pieces(strong_side);
-    int strong_count = popcount(strong_pieces);  // includes king
-
-    if (strong_count == 2) {
-        // King + one piece. Drawn if that piece is a lone bishop or knight.
-        if (board.piece_bb(strong_side, BISHOP) || board.piece_bb(strong_side, KNIGHT))
-            return 0;
-    }
-    else if (strong_count == 3) {
-        // King + two pieces. Check the two specific drawn combinations.
-        Bitboard knights = board.piece_bb(strong_side, KNIGHT);
-        Bitboard bishops = board.piece_bb(strong_side, BISHOP);
-        Bitboard rooks   = board.piece_bb(strong_side, ROOK);
-        Bitboard queens  = board.piece_bb(strong_side, QUEEN);
-
-        // K + N + N: drawn (two knights cannot force mate against a lone king).
-        if (popcount(knights) == 2 && bishops == 0 && rooks == 0 && queens == 0)
-            return 0;
-
-        // K + B + B: drawn ONLY if both bishops are on same-colored squares.
-        // Two same-color bishops can only attack squares of one color and
-        // cannot force the lone king into a mating net. Opposite-colored
-        // bishops DO mate (a known elementary endgame), so we must distinguish.
-        if (popcount(bishops) == 2 && knights == 0 && rooks == 0 && queens == 0) {
-            // Get both bishop squares and check if they share square color.
-            // Square color parity: (file + rank) & 1 -- 0 = one color, 1 = the other.
-            Bitboard b_copy = bishops;
-            Square s1 = pop_lsb(b_copy);
-            Square s2 = pop_lsb(b_copy);
-            int parity1 = (file_of(s1) + rank_of(s1)) & 1;
-            int parity2 = (file_of(s2) + rank_of(s2)) & 1;
-            if (parity1 == parity2)
-                return 0;  // Same color -- drawn
-            // Opposite colors -- fall through to normal mopup (this IS a win).
-        }
-    }
+    // Every combination this guard used to enumerate inline -- lone minor,
+    // two knights, two same-coloured bishops -- now lives in one place.
+    if (cannot_force_mate(board, strong_side))
+        return 0;
 
     Square strong_king  = board.king_square(strong_side);
     Square weak_king    = board.king_square(weak_side);
@@ -1446,7 +1635,7 @@ static inline Bitboard file_bb(int f) {
 // passed pawn in the endgame is often decisive while in a piece-heavy
 // middlegame it may be blockaded or attacked before it queens.
 
-static Score pawn_structure(const Board& board, int phase_mg) {
+static void pawn_structure_compute(const Board& board, int& mg_out, int& eg_out) {
     // Running totals for the two phase poles. mg_score accumulates the
     // middlegame contribution, eg_score the endgame contribution; both are
     // tracked from White's perspective (White additions are positive, Black
@@ -1633,16 +1822,81 @@ static Score pawn_structure(const Board& board, int phase_mg) {
         }
     }
 
-    // Final blend (Option B): mg_score is the W-B middlegame total,
-    // eg_score the W-B endgame total. phase_mg=256 yields the pure MG total,
-    // phase_mg=0 the pure EG total, intermediate values a weighted mix.
-    // With MG == EG (the initial state of 1.6) this collapses to the table
-    // value algebraically: (v*p + v*(256-p))/256 = v.
-    return Score((mg_score * phase_mg + eg_score * (256 - phase_mg)) / 256);
+    // Raw totals out. The single tapered blend lives in evaluate(),
+    // mirroring score_from_trace().
+    mg_out = mg_score;
+    eg_out = eg_score;
 }
 
 // =============================================================================
 // POSITIONAL EVALUATION
+// =============================================================================
+// PAWN HASH -- cache in front of pawn_structure_compute()
+// =============================================================================
+// pawn_structure_compute() above is a pure function of the pawn configuration.
+// It reads exactly two things from the board -- piece_bb(WHITE, PAWN) and
+// piece_bb(BLACK, PAWN) -- and returns the RAW middlegame and endgame poles;
+// the tapered blend lives in evaluate(), so not even the game phase can change
+// its result. Nothing else about the position can either: the passed-pawn
+// refinements that do read kings and blockading pieces live in
+// positional2_counts(), not here. Its output therefore depends on pawn
+// placement alone, which is exactly what Board::pawn_hash keys.
+//
+// Pawn structure changes rarely inside a search, so the same key recurs across
+// most of a subtree and the table turns a full recomputation into one 64-bit
+// comparison for the large majority of evaluate() calls.
+//
+// Entries self-invalidate: a hit requires the full 64-bit key to match, so a
+// slot holding a different structure simply misses and is overwritten. There
+// is deliberately no clear() -- nothing in a running engine can change what a
+// given pawn structure evaluates to, since eval_weights are fixed at runtime.
+//
+// The empty-slot sentinel is key == 0, which is also the genuine key of a
+// pawnless position. That collision is harmless and exact rather than lucky:
+// with both pawn bitboards empty every term below iterates zero times, so
+// pawn_structure_compute() returns (0, 0) -- precisely what a zeroed slot
+// holds. The bench covers it (position 10 is KBN vs K), so the fingerprint
+// would move if this ever stopped being true.
+//
+// Not compiled into the calibration build (-DFACON_NO_PAWN_CACHE). That
+// build extracts coefficients across several threads, each calling
+// trace_evaluate() and therefore this function; a shared mutable table would
+// be a data race. That build gains nothing from the cache anyway.
+#ifndef FACON_NO_PAWN_CACHE
+
+struct PawnEntry {
+    uint64_t key;  // full pawn key of the cached structure
+    int16_t  mg;   // raw middlegame pole
+    int16_t  eg;   // raw endgame pole
+};
+
+// 2^14 entries * 12 bytes = 192 KB. Power of two so the index is a mask.
+constexpr int      PAWN_CACHE_BITS = 14;
+constexpr uint64_t PAWN_CACHE_MASK = (uint64_t(1) << PAWN_CACHE_BITS) - 1;
+
+static PawnEntry pawn_cache[uint64_t(1) << PAWN_CACHE_BITS];
+
+static void pawn_structure(const Board& board, int& mg_out, int& eg_out) {
+    PawnEntry& e = pawn_cache[board.pawn_hash & PAWN_CACHE_MASK];
+    if (e.key == board.pawn_hash) {
+        mg_out = e.mg;
+        eg_out = e.eg;
+        return;
+    }
+    pawn_structure_compute(board, mg_out, eg_out);
+    e.key = board.pawn_hash;
+    e.mg  = int16_t(mg_out);
+    e.eg  = int16_t(eg_out);
+}
+
+#else  // FACON_NO_PAWN_CACHE
+
+static inline void pawn_structure(const Board& board, int& mg_out, int& eg_out) {
+    pawn_structure_compute(board, mg_out, eg_out);
+}
+
+#endif  // FACON_NO_PAWN_CACHE
+
 // =============================================================================
 // Returns positional bonuses beyond material and PSTs, from White's
 // perspective, blended by game phase. Five terms:
@@ -1666,21 +1920,17 @@ static Score pawn_structure(const Board& board, int phase_mg) {
 //   queen PST.
 //
 // All terms are tapered. Each constant exists in MG and EG forms (eval.h).
-// The function takes phase_mg as a parameter, accumulates running mg/eg
-// totals across all five terms and both sides, and returns the phase-blended
-// score in centipawns from White's perspective. We use the same "blend of
-// the difference" convention (Option B) introduced in pawn_structure() -- a
-// single integer division at the very end. With MG == EG (the initial state
-// of 1.6) the blend collapses algebraically to the table value, so behavior
-// is bit-identical to the pre-tapered version.
+// The function accumulates running mg/eg totals across all five terms and
+// both sides and returns them raw, from White's perspective, through the
+// out-parameters. The single tapered blend lives in evaluate().
 //
 // All computations are bitboard-based and process both colors inside a single
 // outer loop. The function is called once per evaluate() invocation.
 
-static Score positional_eval(const Board& board, int phase_mg) {
+static void positional_eval(const Board& board, int& mg_out, int& eg_out,
+                            ThreatCounts& tc_out) {
     // Running mg/eg totals, from White's perspective. White contributions
     // add to the accumulators with sign +1, Black contributions with sign -1.
-    // Same "blend-of-difference" (Option B) convention used in pawn_structure().
     int mg_score = 0;
     int eg_score = 0;
 
@@ -1692,6 +1942,14 @@ static Score positional_eval(const Board& board, int phase_mg) {
     // unsafe squares from mobility and to detect knight outposts.
     Bitboard white_pawn_attacks = pawn_attacks_bb(WHITE, white_pawns);
     Bitboard black_pawn_attacks = pawn_attacks_bb(BLACK, black_pawns);
+
+    // Attack maps for threat evaluation, accumulated as the mobility sweep
+    // below generates each piece's attack set anyway. See the THREAT section
+    // for why the maps are built here instead of in a sweep of their own.
+    Bitboard pawn_atk[2]  = { white_pawn_attacks, black_pawn_attacks };
+    Bitboard minor_atk[2] = { 0, 0 };
+    Bitboard rook_atk[2]  = { 0, 0 };
+    Bitboard all_atk[2]   = { 0, 0 };
 
     // --- Process each color ---
     for (int c = WHITE; c <= BLACK; c++) {
@@ -1712,7 +1970,9 @@ static Score positional_eval(const Board& board, int phase_mg) {
         Bitboard knights = board.piece_bb(us, KNIGHT);
         while (knights) {
             Square sq = pop_lsb(knights);
-            int moves = popcount(knight_attack(sq) & mob_area);
+            Bitboard katt = knight_attack(sq);
+            minor_atk[c] |= katt;
+            int moves = popcount(katt & mob_area);
             mg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_KNIGHT_MG] * moves;
             eg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_KNIGHT_EG] * moves;
 
@@ -1793,7 +2053,9 @@ static Score positional_eval(const Board& board, int phase_mg) {
         // Per-bishop mobility: count safe squares reachable along diagonals.
         while (bishops) {
             Square sq = pop_lsb(bishops);
-            int moves = popcount(bishop_attack(sq, occ) & mob_area);
+            Bitboard batt = bishop_attack(sq, occ);
+            minor_atk[c] |= batt;
+            int moves = popcount(batt & mob_area);
             mg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_BISHOP_MG] * moves;
             eg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_BISHOP_EG] * moves;
         }
@@ -1802,7 +2064,9 @@ static Score positional_eval(const Board& board, int phase_mg) {
         Bitboard rooks = board.piece_bb(us, ROOK);
         while (rooks) {
             Square sq = pop_lsb(rooks);
-            int moves = popcount(rook_attack(sq, occ) & mob_area);
+            Bitboard ratt = rook_attack(sq, occ);
+            rook_atk[c] |= ratt;
+            int moves = popcount(ratt & mob_area);
             mg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_ROOK_MG] * moves;
             eg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_ROOK_EG] * moves;
 
@@ -1843,21 +2107,30 @@ static Score positional_eval(const Board& board, int phase_mg) {
         // material (900 cp) anyway. We compute the attack set as the union of
         // rook-style and bishop-style attacks (the two halves of queen movement).
         Bitboard queens = board.piece_bb(us, QUEEN);
+        Bitboard other_atk = 0;
         while (queens) {
             Square sq = pop_lsb(queens);
             Bitboard attacks = bishop_attack(sq, occ) | rook_attack(sq, occ);
+            other_atk |= attacks;
             int moves = popcount(attacks & mob_area);
             mg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_QUEEN_MG] * moves;
             eg_score += sign * eval_weights[MOBILITY_START + W_MOBILITY_QUEEN_EG] * moves;
         }
+
+        // Everything this side attacks. The king is not part of any mobility
+        // term, so its attack set is the one lookup added purely for threats.
+        all_atk[c] = pawn_atk[c] | minor_atk[c] | rook_atk[c] | other_atk
+                   | king_attack(board.king_square(us));
     }
 
-    // Final blend (Option B): mg_score is the W-B middlegame total,
-    // eg_score the W-B endgame total. phase_mg=256 yields the pure MG total,
-    // phase_mg=0 the pure EG total, intermediate values a weighted mix.
-    // With MG == EG (the initial state of 1.6) this collapses to a single
-    // value algebraically: (v*p + v*(256-p))/256 = v.
-    return Score((mg_score * phase_mg + eg_score * (256 - phase_mg)) / 256);
+    // Threat counts, from the maps the sweep above just built.
+    threat_counts_from_maps(board, pawn_atk, minor_atk, rook_atk, all_atk,
+                            tc_out);
+
+    // Raw totals out. The single tapered blend lives in evaluate(),
+    // mirroring score_from_trace().
+    mg_out = mg_score;
+    eg_out = eg_score;
 }
 
 // =============================================================================
@@ -1871,114 +2144,124 @@ static Score positional_eval(const Board& board, int phase_mg) {
 // dispatch).
 //
 // Computation order:
-//   1. game_phase()         -- determines MG/EG blend weight.
-//   2. material + PST loop  -- accumulates raw mg_score and eg_score
-//                              totals (Option B), one blend at the end.
-//   3. king_safety()        -- one call per side, returns blended centipawns.
-//   4. pawn_structure()     -- one call, returns symmetric W-B blended score.
-//   5. positional_eval()    -- one call, returns symmetric W-B blended score.
-//   6. mopup_eval()         -- only in pawnless decisive endings.
-//   7. Sign-flip for side to move.
+//   1. game_phase()         -- determines the MG/EG blend weight.
+//   2. material + PST loop  -- material (not tuned, phase-independent) goes
+//                              into `additional`; raw PST entries into the
+//                              mg/eg accumulators.
+//   3. king_safety()        -- raw per-king mg/eg into the accumulators.
+//   4. tropism()            -- same.
+//   5. shelter_storm()      -- same.
+//   6. king_safety_v2()     -- same.
+//   7. pawn_structure()     -- raw symmetric W-B mg/eg into the accumulators.
+//   8. positional_eval()    -- same.
+//   9. positional2()        -- same (tempo carries the side-to-move sign).
+//  10. One blend + additional -- the only tapered blend in the eval path,
+//                              the same expression score_from_trace() uses.
+//  11. mopup_eval()         -- only in pawnless decisive endings, post-blend.
+//  12. Sign-flip for side to move.
 
 Score evaluate(const Board& board) {
     int phase_mg = game_phase(board);
 
-    // ---- Material + PST: accumulate raw MG and EG totals separately.
-    //
-    // mg_score and eg_score hold the running White-minus-Black totals for
-    // the middlegame and endgame poles respectively. For each piece we add
-    // its material value (phase-independent, so it goes into BOTH mg and eg)
-    // plus the appropriate raw PST entry (MG into mg_score, EG into
-    // eg_score). White contributions are added with sign +1, Black with -1.
-    //
-    // Then a single blend at the very end (after king safety, pawn
-    // structure, and positional eval are added) collapses the two poles
-    // into one score. This is the same "blend-of-totals" (Option B) shape
-    // used by pawn_structure() and positional_eval(), so the entire eval
-    // now lives in a single blend.
-    int mg_score = 0;
-    int eg_score = 0;
+    // ---- Accumulators. mg_score / eg_score hold the running White-minus-
+    // Black totals of every TUNED term at its raw middlegame and endgame
+    // poles. `additional` holds the non-tuned, phase-independent terms
+    // (material here, mopup further down) exactly, outside the blend. This
+    // mirrors the EvalTrace decomposition: identical integer totals, one
+    // identical blend, identical additional term -- which is what makes
+    // evaluate() == score_from_trace() hold bit-for-bit by construction.
+    int   mg_score   = 0;
+    int   eg_score   = 0;
+    Score additional = 0;
 
+    // ---- Material + PST. Material is phase-independent and deliberately
+    // not tuned, so it contributes to `additional` (the trace keeps it in
+    // additional_score for the same reason). Raw PST entries go into the
+    // mg/eg poles. White adds with sign +1, Black with -1.
     for (int pt = PAWN; pt <= KING; pt++) {
         PieceType piece_type = PieceType(pt);
 
-        // White pieces: add material + raw MG entry to mg_score,
-        // and material + raw EG entry to eg_score.
         Bitboard wb = board.piece_bb(WHITE, piece_type);
         while (wb) {
             Square sq = pop_lsb(wb);
-            mg_score += PIECE_VALUE[pt] + pst_mg_value(piece_type, WHITE, sq);
-            eg_score += PIECE_VALUE[pt] + pst_eg_value(piece_type, WHITE, sq);
+            additional += PIECE_VALUE[pt];
+            mg_score   += pst_mg_value(piece_type, WHITE, sq);
+            eg_score   += pst_eg_value(piece_type, WHITE, sq);
         }
 
-        // Black pieces: same shape, subtracted instead of added.
         Bitboard bb = board.piece_bb(BLACK, piece_type);
         while (bb) {
             Square sq = pop_lsb(bb);
-            mg_score -= PIECE_VALUE[pt] + pst_mg_value(piece_type, BLACK, sq);
-            eg_score -= PIECE_VALUE[pt] + pst_eg_value(piece_type, BLACK, sq);
+            additional -= PIECE_VALUE[pt];
+            mg_score   -= pst_mg_value(piece_type, BLACK, sq);
+            eg_score   -= pst_eg_value(piece_type, BLACK, sq);
         }
     }
 
-    // ---- King safety: fold the raw (un-blended) MG and EG penalties into the
-    // running mg_score / eg_score totals BEFORE the single blend below. White's
-    // king being attacked is a penalty to White (subtract its raw penalty,
-    // which is negative, i.e. add it); Black's is a penalty to Black (negate).
-    // Accumulating raw and blending once -- rather than blending each king's
-    // penalty separately -- keeps evaluate() bit-identical to score_from_trace()
-    // (same number of integer divisions, no per-term truncation drift).
+    // ---- King safety: raw per-king MG/EG penalties, White minus Black,
+    // straight into the accumulators.
     int ks_w_mg, ks_w_eg, ks_b_mg, ks_b_eg;
-    king_safety(board, WHITE, phase_mg, ks_w_mg, ks_w_eg);
-    king_safety(board, BLACK, phase_mg, ks_b_mg, ks_b_eg);
+    king_safety(board, WHITE, ks_w_mg, ks_w_eg);
+    king_safety(board, BLACK, ks_b_mg, ks_b_eg);
     mg_score += ks_w_mg - ks_b_mg;
     eg_score += ks_w_eg - ks_b_eg;
 
-    // ---- Piece tropism: same pattern as king safety. White's pieces near the
-    // black king is a bonus for White (add White's raw, subtract Black's), all
-    // folded into the single blend below for bit-exact agreement with the trace.
+    // ---- Piece tropism: same pattern.
     int tr_w_mg, tr_w_eg, tr_b_mg, tr_b_eg;
-    tropism(board, WHITE, phase_mg, tr_w_mg, tr_w_eg);
-    tropism(board, BLACK, phase_mg, tr_b_mg, tr_b_eg);
+    tropism(board, WHITE, tr_w_mg, tr_w_eg);
+    tropism(board, BLACK, tr_b_mg, tr_b_eg);
     mg_score += tr_w_mg - tr_b_mg;
     eg_score += tr_w_eg - tr_b_eg;
 
-    // ---- Pawn shelter/storm: same pattern. Good shelter / dangerous storm is
-    // scored per king from White's perspective (add White's raw, subtract
-    // Black's), folded into the single blend below for bit-exact agreement
-    // with the trace.
+    // ---- Pawn shelter/storm: same pattern.
     int ss_w_mg, ss_w_eg, ss_b_mg, ss_b_eg;
-    shelter_storm(board, WHITE, phase_mg, ss_w_mg, ss_w_eg);
-    shelter_storm(board, BLACK, phase_mg, ss_b_mg, ss_b_eg);
+    shelter_storm(board, WHITE, ss_w_mg, ss_w_eg);
+    shelter_storm(board, BLACK, ss_b_mg, ss_b_eg);
     mg_score += ss_w_mg - ss_b_mg;
     eg_score += ss_w_eg - ss_b_eg;
 
-    // ---- King safety v2: open files toward the king + safe checks. Same
-    // pattern -- penalties scored per king from White's perspective, folded
-    // raw into the single blend for bit-exact agreement with the trace.
+    // ---- King safety v2 (open files toward the king + safe checks): same
+    // pattern.
     int k2_w_mg, k2_w_eg, k2_b_mg, k2_b_eg;
-    king_safety_v2(board, WHITE, phase_mg, k2_w_mg, k2_w_eg);
-    king_safety_v2(board, BLACK, phase_mg, k2_b_mg, k2_b_eg);
+    king_safety_v2(board, WHITE, k2_w_mg, k2_w_eg);
+    king_safety_v2(board, BLACK, k2_b_mg, k2_b_eg);
     mg_score += k2_w_mg - k2_b_mg;
     eg_score += k2_w_eg - k2_b_eg;
 
-    // ---- Blend material + PST + king safety (+ v2) + tropism + shelter/storm
-    // to a single score in centipawns. (v*p + v*(256-p))/256 = v when mg==eg.
-    Score score = Score((mg_score * phase_mg + eg_score * (256 - phase_mg)) / 256);
+    // ---- Pawn structure: raw symmetric W-B totals into the accumulators.
+    int ps_mg, ps_eg;
+    pawn_structure(board, ps_mg, ps_eg);
+    mg_score += ps_mg;
+    eg_score += ps_eg;
 
-    // ---- Pawn structure: already returned from White's perspective, add directly.
-    // Takes phase_mg because pawn-structure weights are tapered (since 1.6).
-    score += pawn_structure(board, phase_mg);
+    // ---- Positional eval (mobility, files, outposts, etc.): same pattern.
+    int pe_mg, pe_eg;
+    ThreatCounts tc{};
+    positional_eval(board, pe_mg, pe_eg, tc);
+    mg_score += pe_mg;
+    eg_score += pe_eg;
 
-    // ---- Positional eval (mobility, files, outposts, etc.): same convention.
-    // Tapered since 1.6 -- takes phase_mg like pawn_structure.
-    score += positional_eval(board, phase_mg);
+    // ---- Threats (what is attacked, and by what): symmetric W-B counts
+    // gathered by the sweep above, no side-to-move component.
+    int th_mg, th_eg;
+    threats_from_counts(tc, th_mg, th_eg);
+    mg_score += th_mg;
+    eg_score += th_eg;
 
-    // ---- Positional batch (1.6): tempo, bishop outpost, and passed-pawn
-    // refinement. Returns a blended White-perspective score (tempo carries the
-    // side-to-move sign internally, which survives the final sign-flip below).
-    // Added before mopup.
+    // ---- Positional batch (tempo, bishop outpost, passed-pawn refinement):
+    // same pattern. Tempo carries the side-to-move sign internally, which
+    // survives the final sign-flip below.
     int p2_mg, p2_eg;
-    score += positional2(board, board.side_to_move, phase_mg, p2_mg, p2_eg);
+    positional2(board, board.side_to_move, p2_mg, p2_eg);
+    mg_score += p2_mg;
+    eg_score += p2_eg;
+
+    // ---- The single tapered blend, plus the exact non-tuned terms. This is
+    // the same expression score_from_trace() applies to the summed
+    // coefficients, so both paths produce the same integer for every
+    // position. The only integer division in the evaluation path.
+    Score score = Score((mg_score * phase_mg + eg_score * (256 - phase_mg)) / 256)
+                + additional;
 
     // ---- Mopup: only in pawnless endings where one side has a decisive
     // material edge. The threshold prevents corner-chasing in unclear or
@@ -1989,6 +2272,15 @@ Score evaluate(const Board& board) {
         Color strong_side = (score > 0) ? WHITE : BLACK;
         score += mopup_eval(board, strong_side);
     }
+
+    // ---- Endgame scaling: shrink the score toward zero when the material
+    // signature says the position cannot be converted. Multiplicative and
+    // never zero, so the ordering between "keep the piece" and "lose it"
+    // survives (see SCALE_* in eval.h). The strong side is read off the
+    // sign of the score, the same way mopup picks it just above.
+    int scale = endgame_scale(board, (score > 0) ? WHITE : BLACK);
+    if (scale != SCALE_NORMAL)
+        score = Score(score * scale / SCALE_NORMAL);
 
     // ---- Final sign-flip: search expects "good for side to move" sign.
     return (board.side_to_move == WHITE) ? score : -score;
@@ -2035,8 +2327,9 @@ Score evaluate(const Board& board) {
 //
 // We implement trace_evaluate as a copy of evaluate() with the score updates
 // replaced by coefficient updates. We deliberately do NOT call the helpers
-// pawn_structure() / positional_eval() etc., because those functions return
-// blended scores; we need the raw counts before any blend.
+// pawn_structure() / positional_eval() etc.: they produce weighted MG/EG
+// totals (counts already multiplied by weights), while the trace needs the
+// per-slot counts themselves.
 
 // Helper: bump the MG and EG slots of a feature by `delta`. Used heavily
 // in the trace walk. `mg_idx` is the absolute index in coefficients[] of
@@ -2104,7 +2397,7 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
 
     // ---- King safety: tunable in 1.6. Instead of folding a fixed penalty
     // into additional_score, we record coefficients for the KING_SAFETY group
-    // so the tuner can optimise the per-attacker-type weights and the
+    // so the fit can optimise the per-attacker-type weights and the
     // attacker-count buckets. We MUST use the same counting routine king_safety()
     // uses (king_zone_attackers) so the traced coefficients reproduce the score
     // exactly.
@@ -2136,7 +2429,7 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
     }
 
     // ---- Piece tropism: record the (piece, distance-bucket) counts so the
-    // tuner optimises the tropism weights. Same shared counting routine
+    // fit optimises the tropism weights. Same shared counting routine
     // tropism() uses (tropism_counts), so the coefficients reproduce the score
     // exactly. Tropism is a bonus to `us` (pieces near the enemy king), and
     // evaluate() folds White's with +1 and Black's with -1; since the weights
@@ -2154,12 +2447,12 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
     }
 
     // ---- Pawn shelter/storm: record the (category, bucket) counts so the
-    // tuner optimises the shelter and storm weights. Same shared counting
+    // fit optimises the shelter and storm weights. Same shared counting
     // routine shelter_storm() uses (shelter_storm_counts), so the coefficients
     // reproduce the score exactly. Like tropism, evaluate() folds White's
     // contribution with +1 and Black's with -1, so the matching coefficient
     // sign is +1 for White and -1 for Black (the weights are free-signed:
-    // shelter likely positive, storm likely negative -- the tuner decides).
+    // shelter likely positive, storm likely negative -- the fit decides).
     for (Color us : {WHITE, BLACK}) {
         ShelterStormCounts sc = shelter_storm_counts(board, us);
         int sign = (us == WHITE) ? +1 : -1;
@@ -2303,6 +2596,15 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
     Bitboard white_pawn_attacks = pawn_attacks_bb(WHITE, white_pawns);
     Bitboard black_pawn_attacks = pawn_attacks_bb(BLACK, black_pawns);
 
+    // Threat attack maps, accumulated exactly as positional_eval() does --
+    // the same `|=` lines on the same attack sets this walk already
+    // generates for mobility. Only the accumulation is duplicated; the
+    // counting itself is threat_counts_from_maps(), shared with evaluate().
+    Bitboard t_pawn_atk[2]  = { white_pawn_attacks, black_pawn_attacks };
+    Bitboard t_minor_atk[2] = { 0, 0 };
+    Bitboard t_rook_atk[2]  = { 0, 0 };
+    Bitboard t_all_atk[2]   = { 0, 0 };
+
     for (int c = WHITE; c <= BLACK; c++) {
         Color us = Color(c);
         int sign = (us == WHITE) ? +1 : -1;
@@ -2316,7 +2618,9 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
         Bitboard knights = board.piece_bb(us, KNIGHT);
         while (knights) {
             Square sq = pop_lsb(knights);
-            int moves = popcount(knight_attack(sq) & mob_area);
+            Bitboard katt = knight_attack(sq);
+            t_minor_atk[c] |= katt;
+            int moves = popcount(katt & mob_area);
             bump_mg_eg(trace, MOBILITY_START + W_MOBILITY_KNIGHT_MG, sign * moves);
 
             int rel_rank = (us == WHITE) ? rank_of(sq) : 7 - rank_of(sq);
@@ -2356,7 +2660,9 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
         }
         while (bishops) {
             Square sq = pop_lsb(bishops);
-            int moves = popcount(bishop_attack(sq, occ) & mob_area);
+            Bitboard batt = bishop_attack(sq, occ);
+            t_minor_atk[c] |= batt;
+            int moves = popcount(batt & mob_area);
             bump_mg_eg(trace, MOBILITY_START + W_MOBILITY_BISHOP_MG, sign * moves);
         }
 
@@ -2364,7 +2670,9 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
         Bitboard rooks = board.piece_bb(us, ROOK);
         while (rooks) {
             Square sq = pop_lsb(rooks);
-            int moves = popcount(rook_attack(sq, occ) & mob_area);
+            Bitboard ratt = rook_attack(sq, occ);
+            t_rook_atk[c] |= ratt;
+            int moves = popcount(ratt & mob_area);
             bump_mg_eg(trace, MOBILITY_START + W_MOBILITY_ROOK_MG, sign * moves);
 
             Bitboard this_file = file_bb(file_of(sq));
@@ -2390,12 +2698,31 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
 
         // QUEEN mobility
         Bitboard queens = board.piece_bb(us, QUEEN);
+        Bitboard t_other_atk = 0;
         while (queens) {
             Square sq = pop_lsb(queens);
             Bitboard attacks = bishop_attack(sq, occ) | rook_attack(sq, occ);
+            t_other_atk |= attacks;
             int moves = popcount(attacks & mob_area);
             bump_mg_eg(trace, MOBILITY_START + W_MOBILITY_QUEEN_MG, sign * moves);
         }
+
+        t_all_atk[c] = t_pawn_atk[c] | t_minor_atk[c] | t_rook_atk[c]
+                     | t_other_atk | king_attack(board.king_square(us));
+    }
+
+    // ---- Threats: same shared counting function evaluate() uses, so the
+    // two paths cannot drift apart in what a threat means.
+    {
+        ThreatCounts tc{};
+        threat_counts_from_maps(board, t_pawn_atk, t_minor_atk, t_rook_atk,
+                                t_all_atk, tc);
+        if (tc.pawn_on_minor)  bump_mg_eg(trace, THREAT_START + W_THREAT_PAWN_ON_MINOR_MG,  tc.pawn_on_minor);
+        if (tc.pawn_on_major)  bump_mg_eg(trace, THREAT_START + W_THREAT_PAWN_ON_MAJOR_MG,  tc.pawn_on_major);
+        if (tc.minor_on_major) bump_mg_eg(trace, THREAT_START + W_THREAT_MINOR_ON_MAJOR_MG, tc.minor_on_major);
+        if (tc.rook_on_queen)  bump_mg_eg(trace, THREAT_START + W_THREAT_ROOK_ON_QUEEN_MG,  tc.rook_on_queen);
+        if (tc.hanging)        bump_mg_eg(trace, THREAT_START + W_THREAT_HANGING_MG,        tc.hanging);
+        if (tc.pawn_push)      bump_mg_eg(trace, THREAT_START + W_THREAT_PAWN_PUSH_MG,      tc.pawn_push);
     }
 
     // ---- Mopup. The activation test in evaluate() looks at the
@@ -2418,6 +2745,24 @@ void trace_evaluate(const Board& board, EvalTrace& trace) {
             Color strong_side = (pre_mopup > 0) ? WHITE : BLACK;
             trace.additional_score += mopup_eval(board, strong_side);
         }
+    }
+
+    // ---- Endgame scale. evaluate() decides it from the sign of the
+    // complete pre-scale score, so reproduce that score here (mopup
+    // included) and record the factor. Unlike the mopup block above this
+    // runs for every position, since opposite-coloured-bishop endings have
+    // pawns on the board.
+    {
+        int mg_total = 0, eg_total = 0;
+        for (int i = 0; i < NUM_WEIGHTS; i += 2) {
+            mg_total += trace.coefficients[i + 0] * eval_weights[i + 0];
+            eg_total += trace.coefficients[i + 1] * eval_weights[i + 1];
+        }
+        Score pre_scale = Score((mg_total * phase_mg
+                               + eg_total * (256 - phase_mg)) / 256)
+                        + trace.additional_score;
+        trace.endgame_scale =
+            endgame_scale(board, (pre_scale > 0) ? WHITE : BLACK);
     }
 }
 
@@ -2445,6 +2790,8 @@ Score score_from_trace(const EvalTrace& trace,
     Score blended = Score((mg_total * trace.phase_mg
                          + eg_total * (256 - trace.phase_mg)) / 256);
     Score from_white = blended + trace.additional_score;
+    if (trace.endgame_scale != SCALE_NORMAL)
+        from_white = Score(from_white * trace.endgame_scale / SCALE_NORMAL);
     return (side_to_move == WHITE) ? from_white : -from_white;
 }
 
@@ -2490,50 +2837,68 @@ void evaluate_verbose(const Board& board) {
     Score pst_w = Score((pst_mg_w * phase_mg + pst_eg_w * (256 - phase_mg)) / 256);
     Score pst_b = Score((pst_mg_b * phase_mg + pst_eg_b * (256 - phase_mg)) / 256);
 
-    // King safety per side (blended value for display). The raw MG/EG outputs
-    // are not needed here, so they go into throwaway locals.
+    // King safety per side. Raw MG/EG from the helper; blended locally for
+    // the display rows (the helpers no longer blend -- the single blend in
+    // the eval path lives in evaluate()).
     int ks_vw_mg, ks_vw_eg, ks_vb_mg, ks_vb_eg;
-    Score king_safety_w = king_safety(board, WHITE, phase_mg, ks_vw_mg, ks_vw_eg);
-    Score king_safety_b = king_safety(board, BLACK, phase_mg, ks_vb_mg, ks_vb_eg);
+    king_safety(board, WHITE, ks_vw_mg, ks_vw_eg);
+    king_safety(board, BLACK, ks_vb_mg, ks_vb_eg);
+    Score king_safety_w = Score((ks_vw_mg * phase_mg + ks_vw_eg * (256 - phase_mg)) / 256);
+    Score king_safety_b = Score((ks_vb_mg * phase_mg + ks_vb_eg * (256 - phase_mg)) / 256);
 
-    // Tropism and shelter/storm per side (blended, for display and the partial
-    // total). Like king safety these fold into evaluate()'s single blend, so
-    // the per-side display values can drift ~1 cp from evaluate(); the real
-    // total below is recomputed from raw mg/eg to stay bit-exact.
+    // Tropism, shelter/storm and king safety v2 per side: raw MG/EG from the
+    // helpers, blended locally for the display rows.
     int tr_vw_mg, tr_vw_eg, tr_vb_mg, tr_vb_eg;
-    Score tropism_w = tropism(board, WHITE, phase_mg, tr_vw_mg, tr_vw_eg);
-    Score tropism_b = tropism(board, BLACK, phase_mg, tr_vb_mg, tr_vb_eg);
+    tropism(board, WHITE, tr_vw_mg, tr_vw_eg);
+    tropism(board, BLACK, tr_vb_mg, tr_vb_eg);
+    Score tropism_w = Score((tr_vw_mg * phase_mg + tr_vw_eg * (256 - phase_mg)) / 256);
+    Score tropism_b = Score((tr_vb_mg * phase_mg + tr_vb_eg * (256 - phase_mg)) / 256);
 
     int ss_vw_mg, ss_vw_eg, ss_vb_mg, ss_vb_eg;
-    Score shelter_w = shelter_storm(board, WHITE, phase_mg, ss_vw_mg, ss_vw_eg);
-    Score shelter_b = shelter_storm(board, BLACK, phase_mg, ss_vb_mg, ss_vb_eg);
+    shelter_storm(board, WHITE, ss_vw_mg, ss_vw_eg);
+    shelter_storm(board, BLACK, ss_vb_mg, ss_vb_eg);
+    Score shelter_w = Score((ss_vw_mg * phase_mg + ss_vw_eg * (256 - phase_mg)) / 256);
+    Score shelter_b = Score((ss_vb_mg * phase_mg + ss_vb_eg * (256 - phase_mg)) / 256);
 
     int k2_vw_mg, k2_vw_eg, k2_vb_mg, k2_vb_eg;
-    Score ksv2_w = king_safety_v2(board, WHITE, phase_mg, k2_vw_mg, k2_vw_eg);
-    Score ksv2_b = king_safety_v2(board, BLACK, phase_mg, k2_vb_mg, k2_vb_eg);
+    king_safety_v2(board, WHITE, k2_vw_mg, k2_vw_eg);
+    king_safety_v2(board, BLACK, k2_vb_mg, k2_vb_eg);
+    Score ksv2_w = Score((k2_vw_mg * phase_mg + k2_vw_eg * (256 - phase_mg)) / 256);
+    Score ksv2_b = Score((k2_vb_mg * phase_mg + k2_vb_eg * (256 - phase_mg)) / 256);
 
-    Score pawn_struct  = pawn_structure(board, phase_mg);
-    Score positional   = positional_eval(board, phase_mg);
+    // Pawn structure / positional / positional2: raw symmetric W-B totals,
+    // blended locally for the display rows.
+    int ps_v_mg, ps_v_eg;
+    pawn_structure(board, ps_v_mg, ps_v_eg);
+    Score pawn_struct = Score((ps_v_mg * phase_mg + ps_v_eg * (256 - phase_mg)) / 256);
+
+    int pe_v_mg, pe_v_eg;
+    ThreatCounts tc_v{};
+    positional_eval(board, pe_v_mg, pe_v_eg, tc_v);
+    Score positional = Score((pe_v_mg * phase_mg + pe_v_eg * (256 - phase_mg)) / 256);
+
     int p2v_mg, p2v_eg;
-    Score positional2_s = positional2(board, board.side_to_move, phase_mg, p2v_mg, p2v_eg);
+    positional2(board, board.side_to_move, p2v_mg, p2v_eg);
+    Score positional2_s = Score((p2v_mg * phase_mg + p2v_eg * (256 - phase_mg)) / 256);
 
-    // Real total = same Option B blend evaluate() does. We compute it from
-    // the raw mg/eg totals to match evaluate() bit-for-bit (not from the
-    // displayed per-side blends, which can drift by ~1 cp once MG != EG due
-    // to integer truncation rounding in different places).
-    int mg_total = (material_w - material_b) + (pst_mg_w - pst_mg_b);
-    int eg_total = (material_w - material_b) + (pst_eg_w - pst_eg_b);
-    Score material_pst_blended = Score((mg_total * phase_mg
-                                      + eg_total * (256 - phase_mg)) / 256);
+    // Real total = exactly what evaluate() computes: every tuned raw MG/EG
+    // total into one blend, material exact outside it. Bit-identical to
+    // evaluate() by construction (the displayed per-side blends above are
+    // informational and round independently).
+    int mg_total = (pst_mg_w - pst_mg_b)
+                 + (ks_vw_mg - ks_vb_mg) + (k2_vw_mg - k2_vb_mg)
+                 + (tr_vw_mg - tr_vb_mg) + (ss_vw_mg - ss_vb_mg)
+                 + ps_v_mg + pe_v_mg + p2v_mg;
+    int eg_total = (pst_eg_w - pst_eg_b)
+                 + (ks_vw_eg - ks_vb_eg) + (k2_vw_eg - k2_vb_eg)
+                 + (tr_vw_eg - tr_vb_eg) + (ss_vw_eg - ss_vb_eg)
+                 + ps_v_eg + pe_v_eg + p2v_eg;
 
     // Partial total = everything except mopup. Used to replicate the mopup
     // activation test from evaluate() (which uses the score-so-far).
-    Score partial = material_pst_blended
-                  + (king_safety_w - king_safety_b)
-                  + (ksv2_w - ksv2_b)
-                  + (tropism_w - tropism_b)
-                  + (shelter_w - shelter_b)
-                  + pawn_struct + positional + positional2_s;
+    Score partial = Score((mg_total * phase_mg
+                         + eg_total * (256 - phase_mg)) / 256)
+                  + Score(material_w - material_b);
 
     Score mopup = 0;
     bool no_pawns = board.piece_bb(PAWN) == 0;
@@ -2542,7 +2907,14 @@ void evaluate_verbose(const Board& board) {
         mopup = mopup_eval(board, strong_side);
     }
 
-    Score total_white_pov = partial + mopup;
+    // Endgame scaling, mirroring evaluate(). Displayed as its own row below
+    // so the "eval" command shows a scaled ending for what it is instead of
+    // silently reporting a number the search never sees.
+    Score pre_scale  = partial + mopup;
+    int   eg_scale   = endgame_scale(board, (pre_scale > 0) ? WHITE : BLACK);
+    Score total_white_pov = (eg_scale != SCALE_NORMAL)
+                          ? Score(pre_scale * eg_scale / SCALE_NORMAL)
+                          : pre_scale;
     Score total_stm = (board.side_to_move == WHITE) ? total_white_pov : -total_white_pov;
 
     // Determine why mopup was skipped (if it was), so we can show an accurate

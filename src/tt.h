@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-01 15:37
+// Last modified: 2026-07-17 09:25
 // tt.h -- Transposition Table
 //
 // A hash table that caches search results to avoid re-searching positions
@@ -57,13 +57,50 @@
 //   - hashfull() now counts only entries from the current generation, so
 //     the value reflects how much of the TT contains data relevant to the
 //     search in progress (not stale data from earlier moves).
+//
+// Facon 1.7 -- Filo
+//   - Hash option limits centralized: HASH_MIN_MB, HASH_MAX_MB,
+//     HASH_DEFAULT_MB and HASH_RAM_RESERVE_MB are the single source of
+//     truth for the UCI Hash option. The option declaration (uci.cpp), the
+//     parser clamps and the enforcement in resize() all read these
+//     constants, so the advertised range and the enforced range can no
+//     longer diverge. Maximum raised from 1024 MB to 1 TiB.
+//   - table_ changed from std::vector<TTEntry> to std::unique_ptr<TTEntry[]>
+//     so storage can be allocated with new(std::nothrow). Under
+//     -fno-exceptions a failed vector allocation called std::terminate()
+//     and aborted the engine; a failed nothrow allocation returns nullptr
+//     and resize() recovers gracefully (see tt.cpp).
+//   - TTEntry gained a static-eval field at zero size cost: the stored
+//     move shrank to its natural 16 bits (move16, see the struct comment),
+//     and the freed bytes hold the node's evaluation (EVAL_NONE for
+//     in-check nodes). store() takes the eval; probe() returns it with the
+//     entry. Entries remain exactly 16 bytes (static_assert enforced).
 // =============================================================================
 
 #pragma once
 
 #include "types.h"
 #include <cstring>
-#include <vector>
+#include <memory>
+
+// =============================================================================
+// HASH OPTION LIMITS
+// =============================================================================
+// Single source of truth for the UCI "Hash" option (sizes in megabytes).
+// The option declaration in uci.cpp, the range clamps in cmd_setoption()
+// and the enforcement in resize() all read these constants, so the range
+// the engine advertises and the range it enforces cannot diverge.
+
+constexpr int HASH_MIN_MB     = 1;        // Smallest usable table
+constexpr int HASH_MAX_MB     = 1048576;  // 1 TiB
+constexpr int HASH_DEFAULT_MB = 16;       // Constructor and UCI option default
+
+// Physical-RAM headroom (in MB) that resize() leaves untouched when capping
+// an oversized request: room for the engine's own allocations, the GUI and
+// normal OS jitter. A table pushed into swap turns TT probes into disk
+// seeks, so staying inside physical RAM matters more than table size.
+// See available_physical_mb() in tt.cpp.
+constexpr int HASH_RAM_RESERVE_MB = 128;
 
 // =============================================================================
 // BOUND TYPE
@@ -110,13 +147,29 @@ inline uint8_t make_gen_bound(uint8_t gen, BoundType bound) {
 // TT ENTRY -- 16 bytes exactly, no padding
 // =============================================================================
 
+// The move is stored in 16 bits: the engine's Move encoding uses exactly
+// bits 0..15 (from | to<<6 | type<<12 | promo<<14, see types.h), so the
+// truncation loses nothing and Move(move16) restores the full move. The
+// two bytes this frees hold the node's static evaluation, keeping the
+// entry at exactly 16 bytes -- same entries-per-MB as before the eval
+// channel existed.
 struct TTEntry {
     uint64_t  hash;       // Full Zobrist hash for collision verification  (8 bytes)
-    Move      move;       // Best move found from this position            (4 bytes)
+    uint16_t  move16;     // Best move, 16-bit encoding (see above)        (2 bytes)
     int16_t   score;      // Search score (mate-distance adjusted)         (2 bytes)
+    int16_t   eval;       // Static eval of the node; EVAL_NONE in check   (2 bytes)
     uint8_t   depth;      // Depth at which this entry was searched        (1 byte, max 255)
     uint8_t   gen_bound;  // Packed generation (6 bits) + bound (2 bits)   (1 byte)
+
+    // The stored best move as a full Move. MOVE_NONE round-trips as 0.
+    Move best_move() const { return Move(move16); }
 };
+
+static_assert(sizeof(TTEntry) == 16, "TTEntry must stay 16 bytes");
+
+// Sentinel for "no static eval stored" (nodes in check do not evaluate).
+// INT16_MIN is far outside any legal score, mate range included.
+constexpr int16_t EVAL_NONE = INT16_MIN;
 
 // =============================================================================
 // TRANSPOSITION TABLE
@@ -124,11 +177,15 @@ struct TTEntry {
 
 class TranspositionTable {
 public:
-    // Create a TT with the given size in megabytes (default: 16 MB)
-    explicit TranspositionTable(int mb = 16);
+    // Create a TT with the given size in megabytes
+    explicit TranspositionTable(int mb = HASH_DEFAULT_MB);
 
     // Resize and clear the table (used by the UCI "setoption Hash" command).
-    // Pass silent=true to suppress the diagnostic message (used internally
+    // The size is clamped to [HASH_MIN_MB, HASH_MAX_MB], capped to available
+    // physical RAM minus a reserve, and rounded down to a power of two.
+    // Allocation failures degrade to a smaller table instead of terminating
+    // the process (see tt.cpp for the full pipeline).
+    // Pass silent=true to suppress informational output (used internally
     // during construction, before the engine banner is printed).
     void resize(int mb, bool silent = false);
 
@@ -143,7 +200,7 @@ public:
     //   - Stored entry is from an old generation (aging).
     // If 'move' is MOVE_NONE and an entry already exists for this hash,
     // the previously stored move is preserved.
-    void store(uint64_t hash, Move move, Score score, int depth,
+    void store(uint64_t hash, Move move, Score score, Score eval, int depth,
                BoundType bound, int ply);
 
     // Probe the table. Returns true and fills 'entry' if a valid entry exists
@@ -169,10 +226,10 @@ public:
     void print_info() const;
 
 private:
-    std::vector<TTEntry> table_;       // Flat array of entries
+    std::unique_ptr<TTEntry[]> table_; // Flat array of entries (nothrow-allocated)
     uint64_t             mask_;        // Bitmask for index computation (size - 1)
     uint64_t             size_;        // Number of entries (always a power of two)
-    int                  mb_;          // Current size in MB (for print_info())
+    int                  mb_;          // Actually allocated size in MB (for print_info())
     uint8_t              generation_;  // Current generation counter (6 bits, wraps at 64)
 
     // Map a Zobrist hash to a table index using bitmasking (fast modulo)

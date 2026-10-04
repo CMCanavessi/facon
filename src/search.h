@@ -1,20 +1,20 @@
 // =============================================================================
-// Last modified: 2026-05-07 07:30
+// Last modified: 2026-07-20 09:30
 // search.h -- Search engine declarations
 //
 // Implements iterative deepening with negamax alpha-beta search and
 // quiescence search. Uses the transposition table and time manager.
 //
-// Facon 1.1 — Herrumbre
+// Facon 1.1 -- Herrumbre
 //   - Killer move heuristic, seldepth tracking, abort flag, root_best_move_,
 //     dynamic time management (soft_stop + extend_time).
 //
-// Facon 1.2 — Rojo Vivo
+// Facon 1.2 -- Rojo Vivo
 //   - Null Move Pruning (NMP): NMP_MIN_DEPTH, NMP_REDUCTION.
 //   - Triangular PV array: pv_table_, pv_length_.
 //   - Verbosity: currmove, new-best SAN, heartbeat (last_heartbeat_ms_).
 //
-// Facon 1.3 — Yunque
+// Facon 1.3 -- Yunque
 //   - depth == 0: quiescence entry condition changed from <= to == as LMR
 //     prerequisite. All reduction call sites use std::max(0, reduced_depth).
 //   - EXTENSION_FULL_DEPTH: depth at which TM extensions apply their full
@@ -26,15 +26,17 @@
 //     legal moves at depth >= LMR_MIN_DEPTH are searched at reduced depth if
 //     they are quiet and not in check. Re-searched at full depth if they raise
 //     alpha. Constants: LMR_MIN_DEPTH=3, LMR_MIN_MOVES=3, LMR_DIVISOR=2.25.
-//   - History heuristic: quiet moves that cause a beta cutoff increment
-//     history_[color][from][to] by depth^2. Scores replace ORDER_QUIET=0
-//     in move ordering, improving LMR accuracy. Reset each search.
+//   - History heuristic (two-sided, gravity): a quiet that causes a beta
+//     cutoff gets a depth^2 bonus; every quiet searched before it at the
+//     same node gets the symmetric malus. Entries live in
+//     [-HISTORY_MAX, HISTORY_MAX] and move_score() maps them back into the
+//     classic [0, HISTORY_MAX] ordering band. Reset each search.
 //   - Aspiration windows: the ID loop searches with a narrow window around
 //     the previous iteration's score instead of (-INFINITE, +INFINITE). On
 //     fail-low or fail-high, the window widens on the failing side and the
 //     search repeats. Applied from depth >= 4. ASP_WINDOW=50cp initial width.
 //
-// Facon 1.3 — Yunque (post-gauntlet fixes)
+// Facon 1.3 -- Yunque (post-gauntlet fixes)
 //   - mate_reduction_applied_: one-shot guard so reduce_time("mate found")
 //     fires at most once per search. Without it, is_mate_score() is true on
 //     every iteration after a mate is found, applying x0.05 repeatedly and
@@ -45,7 +47,7 @@
 //     capping soft. Both limits rise together on subsequent extensions, capped
 //     at 50% of raw remaining clock. Only triggered by real instability (a
 //     stable position at depth 25+ would have fired easy-move reduction first).
-//     EMERGENCY_DEPTH removed from search.h — it is a TM internal constant.
+//     EMERGENCY_DEPTH removed from search.h -- it is a TM internal constant.
 //   - Aspiration window fail-low fix: beta_asp is no longer modified on a
 //     fail-low. The old "beta_asp = (alpha_asp + beta_asp) / 2" squeezed the
 //     upper bound and could cause artificial fail-highs on re-search via TT
@@ -61,7 +63,7 @@
 //   - LMR reduction table: precomputed int LMR_table[MAX_PLY][MAX_MOVES]
 //     replaces the per-move std::log(depth) * std::log(move) / LMR_DIVISOR
 //     calculation in the negamax hot path. Initialized once at startup via
-//     init_lmr_table(). Same formula, same results — pure speedup.
+//     init_lmr_table(). Same formula, same results -- pure speedup.
 //   - FACON_DEBUG diagnostic counters: LMR attempted/re-searched, NMP
 //     attempted/cutoffs, TT cutoffs. Compiled only with -DFACON_DEBUG.
 //     Reported via "info string ST:" after each completed iteration.
@@ -99,6 +101,38 @@
 //     Replaces the single ORDER_CAPTURE constant. SEE is computed only
 //     when needed; captures with attacker no more valuable than victim
 //     skip the SEE call as they are always favorable.
+//
+// Facon 1.7 -- Filo
+//   - History heuristic upgraded to the standard two-sided gravity scheme:
+//     beta-cutoff quiets earn a bonus, the quiets searched before them at
+//     the same node earn the symmetric malus, and both updates use the
+//     gravity form so entries converge on +/-HISTORY_MAX instead of
+//     clamping. move_score() maps entries back into the classic
+//     [0, HISTORY_MAX] ordering band, leaving every other tier untouched.
+//   - Continuation history (1-ply): a second two-sided gravity table
+//     conditioned on the opponent's previous move, combined 1:1 with the
+//     butterfly in move ordering. Persists across searches within a game
+//     (cleared per game via new_game(), called from ucinewgame); the
+//     butterfly keeps its per-search reset.
+//   - Static evaluation channel: every non-check node evaluates once (the
+//     TT eval is reused and bound-refined when available), records it in
+//     eval_stack_[ply], and derives `improving` -- eval rising versus two
+//     plies ago. The TT entry gained a 16-bit eval field by packing the
+//     stored move into its natural 16 bits, keeping entries at 16 bytes.
+//     RFP prunes more when improving, move-level futility prunes less, and
+//     LMP tightens to two thirds of its threshold when not improving.
+//   - Singular extensions: when the TT knows this node's best move to
+//     serious depth with a usable bound, the node is re-searched with that
+//     move excluded (excluded_[ply]) at reduced depth against a window
+//     just below the TT score; if everything else fails low, the TT move
+//     is singular and searches one ply deeper. The verification skips the
+//     TT cutoff, stores nothing, and skips the excluded move before the
+//     legal count -- an only-move is therefore correctly singular.
+//   - ProbCut: at non-PV nodes of depth >= PC_MIN_DEPTH, SEE-safe captures
+//     are tried at (depth - 4) against a null window at beta + PC_MARGIN;
+//     the first one to reach it cuts the node immediately. Gated by the
+//     static-eval channel (only attempted when plausibly failing high) and
+//     vetoed by deep TT entries whose score already sits below the target.
 // =============================================================================
 
 #pragma once
@@ -134,7 +168,7 @@ struct SearchStats {
     // Note: use (nodes + qnodes) for total node count and NPS reporting.
 
 #ifdef FACON_DEBUG
-    // Diagnostic counters — compiled only with -DFACON_DEBUG (cmake -DFACON_DEBUG=ON).
+    // Diagnostic counters -- compiled only with -DFACON_DEBUG (cmake -DFACON_DEBUG=ON).
     // Zero cost in release builds. Reported via "info string ST:" after each iteration.
     uint64_t lmr_attempted  = 0;  // Moves searched at reduced depth
     uint64_t lmr_re_searched = 0; // LMR moves that raised alpha and were re-searched
@@ -150,6 +184,11 @@ struct SearchStats {
 
 class Search {
 public:
+
+    // Per-GAME reset (called from ucinewgame): clears the tables whose
+    // signal persists across searches within a game -- today, the
+    // continuation history. Per-search resets live at the top of go().
+    void new_game();
     // Run a full iterative deepening search on the given board.
     // Uses TM (TimeManager) for time control.
     // Prints UCI info lines to stdout and returns the best move found.
@@ -176,7 +215,7 @@ private:
 
     // Abort flag: set to true when the hard time limit is hit inside the search.
     // Checked at the top of every negamax() and quiescence() call so the
-    // recursion unwinds naturally — all unmake_move() calls execute, the board
+    // recursion unwinds naturally -- all unmake_move() calls execute, the board
     // stays consistent, and no TT pollution occurs from partial results.
     // Reset to false at the start of each go() call.
     bool abort_search_ = false;
@@ -184,7 +223,7 @@ private:
     // Best move at the root (ply 0), updated directly inside negamax() whenever
     // a new best move is found at the root node. We never do TT early returns
     // at ply 0, so this is always set from the actual move loop. This is the
-    // authoritative source for bestmove — always legal in the current position.
+    // authoritative source for bestmove -- always legal in the current position.
     // Reset to MOVE_NONE at the start of each iteration.
     Move root_best_move_ = MOVE_NONE;
 
@@ -192,17 +231,19 @@ private:
     // They are likely to be good in sibling nodes at the same ply, so we
     // search them before other quiet moves.
     // Indexed by [ply][slot] where slot is 0 (most recent) or 1 (older).
-    // Reset at the start of each search — killers from previous positions
+    // Reset at the start of each search -- killers from previous positions
     // are irrelevant and can mislead move ordering.
     Move killers_[MAX_PLY][2];
 
-    // History heuristic table: records how often a quiet move from [from] to
-    // [to] by [color] has caused a beta cutoff. Incremented by depth^2 on each
-    // cutoff so deeper searches contribute more. Used in move_score() to order
-    // quiet moves — replaces the flat ORDER_QUIET=0 score.
-    // Capped at HISTORY_MAX to prevent overflow and keep scores in a stable
-    // range relative to ORDER_KILLER2. Reset at the start of each search.
-    static constexpr int HISTORY_MAX = 50000;  // Below ORDER_KILLER2 (80000)
+    // History heuristic table (two-sided): a quiet that causes a beta cutoff
+    // receives a bonus, and every quiet searched before it at that node
+    // receives the symmetric malus. Both updates use the gravity form
+    // (entry += delta - entry * delta / HISTORY_MAX), which pulls entries
+    // toward the +/-HISTORY_MAX asymptote and decays stale values instead of
+    // saturating them into indistinguishable clamps. Used in move_score() to
+    // order quiet moves, mapped into [0, HISTORY_MAX]. Reset at the start of
+    // each search.
+    static constexpr int HISTORY_MAX = 50000;  // Ordering band half-width
     int history_[2][64][64];                   // [color][from][to]
 
     // Countermove table: for each (piece, to_square) of the previous move
@@ -221,11 +262,44 @@ private:
     // Reset at the start of each search alongside killers_ and history_.
     Move countermoves_[15][64];
 
+    // Continuation history (1-ply): history conditioned on the opponent's
+    // previous move. Indexed [prev_piece][prev_to][piece][to] -- where the
+    // butterfly table asks "how good has from->to been in general", this
+    // one asks "how good has this piece-to-this-square been as a reply to
+    // that move". It is the generalization of the countermove above: that
+    // remembers one refutation per opponent move, this learns the whole
+    // distribution. Two-sided gravity updates, same delta and asymptote as
+    // the butterfly (see the cutoff update in negamax); scored 1:1 with the
+    // butterfly in move_score(). First dimension sized 15 for the same
+    // reason as countermoves_ (Piece enum gaps). ~3.5 MB, static storage
+    // (Searcher is a global object).
+    //
+    // Reset per GAME (new_game(), called from ucinewgame), not per search:
+    // clearing 3.5 MB on every "go" would cost ~0.5 ms per move, and the
+    // signal learned earlier in the game is exactly what later moves want.
+    // The butterfly keeps its per-search reset -- that is the policy its
+    // measurements were taken under.
+    int conthist_[15][64][15][64];  // [prev_piece][prev_to][piece][to]
+
+    // Static-eval stack, one slot per ply: eval_stack_[ply] holds the
+    // node's static evaluation (EVAL_NONE while in check). Read two plies
+    // up to derive the `improving` flag -- whether our position has been
+    // getting better since our previous move -- which modulates RFP,
+    // move-level futility and LMP (see the pipeline in negamax).
+    Score eval_stack_[MAX_PLY];
+
+    // Singular-verification exclusion, one slot per ply: when non-null at
+    // a ply, negamax is re-searching that node with this move excluded
+    // (see SINGULAR EXTENSIONS in search.cpp). Set and cleared in a tight
+    // pair around the verification call; zero-initialized in BSS
+    // (MOVE_NONE is 0), so it needs no per-search reset.
+    Move excluded_[MAX_PLY];
+
     // Triangular PV array: stores the principal variation at each ply.
     // pv_table_[ply] holds the PV line from that ply to the end of the search.
     // pv_length_[ply] is the number of valid moves in that line.
     // The table is triangular because the line at ply N can be at most
-    // (MAX_PLY - N) moves long — deeper plies have shorter remaining lines.
+    // (MAX_PLY - N) moves long -- deeper plies have shorter remaining lines.
     Move pv_table_[MAX_PLY][MAX_PLY];
     int  pv_length_[MAX_PLY];
 
@@ -261,7 +335,7 @@ private:
 
     // Number of legal moves to search at full depth before applying LMR.
     // The first LMR_MIN_MOVES moves are the highest-scored (TT move, captures,
-    // killers) and most likely to be best — always searched fully.
+    // killers) and most likely to be best -- always searched fully.
     static constexpr int LMR_MIN_MOVES = 3;
 
     // Divisor in the reduction formula: reduction = log(depth) * log(move) / LMR_DIVISOR.
@@ -295,6 +369,29 @@ private:
     // Margin per depth level for move-level futility pruning (centipawns).
     // At depth d, skip quiet moves if eval + FUTILITY_MARGIN * d <= alpha.
     static constexpr int FUTILITY_MARGIN = 150;
+
+    // Improving modulation (seeds; see the eval pipeline in search.cpp).
+    // RFP prunes MORE when improving -- above beta and rising, trust the
+    // fail-high: its margin shrinks by RFP_IMPROVING_BONUS. Move-level
+    // futility prunes LESS when improving -- below alpha but rising, quiet
+    // moves may keep recovering: its margin grows by FUT_IMPROVING_BONUS.
+    static constexpr int RFP_IMPROVING_BONUS = 60;
+    static constexpr int FUT_IMPROVING_BONUS = 60;
+
+    // Singular extensions: the verification fires only at
+    // depth >= SE_MIN_DEPTH, with a TT entry searched to at least
+    // depth - 3 and a non-UPPER bound. The verification window sits
+    // SE_MARGIN * depth below the TT score.
+    static constexpr int SE_MIN_DEPTH = 8;
+    static constexpr int SE_MARGIN    = 3;
+
+    // ProbCut: at non-PV nodes of depth >= PC_MIN_DEPTH, a SEE-safe capture
+    // whose (depth - 4) search reaches beta + PC_MARGIN triggers an
+    // immediate cutoff. The eval gate skips the attempt unless static_eval
+    // is within PC_EVAL_GATE of beta or above.
+    static constexpr int PC_MIN_DEPTH = 5;
+    static constexpr int PC_MARGIN    = 180;
+    static constexpr int PC_EVAL_GATE = 100;
 
     // -------------------------------------------------------------------------
     // INTERNAL ITERATIVE REDUCTIONS (IIR)
@@ -396,7 +493,7 @@ private:
     // Heartbeat interval in milliseconds. If no output has been emitted for
     // this long, a status line is printed to stdout. Only relevant at very
     // long time controls (VVLTC) where a single iteration can run for many
-    // minutes — allows distinguishing a live deep search from a crash.
+    // minutes -- allows distinguishing a live deep search from a crash.
     static constexpr int64_t HEARTBEAT_INTERVAL_MS = 300000;  // 5 minutes
 
     // Timestamp of the last output line of ANY kind. Updated after every
@@ -409,10 +506,10 @@ private:
     // prevent long silent stretches in the operator's log. Updated by:
     //   - end-of-iteration UCI info lines (go())
     //   - the heartbeat itself (negamax())
-    //   - new-best info strings (negamax()) — these appear as text lines
+    //   - new-best info strings (negamax()) -- these appear as text lines
     //     in the GUI log, so they constitute visible activity that resets
     //     the silence counter.
-    // NOT updated by currmove lines — GUIs consume currmove internally
+    // NOT updated by currmove lines -- GUIs consume currmove internally
     // to update a dedicated panel, but it never appears in the text log.
     // The operator sees nothing from currmove, so it cannot be treated as
     // a sign of activity from their perspective.
@@ -491,14 +588,14 @@ private:
     // once per node from countermoves_ using the parent's prev_move). If
     // MOVE_NONE, no countermove ordering bonus applies.
     int move_score(const Board& board, Move m, Move tt_move,
-                   Move countermove, int ply) const;
+                   Move countermove, int (*ch_row)[64], int ply) const;
 
     // Sort moves in-place from index 'start' onward using selection sort.
     // Selection sort is simple and fast enough for typical move list sizes (~30-50).
     // Takes ply to pass through to move_score for killer lookup.
     // countermove is passed through to move_score for ordering.
     void sort_moves(const Board& board, MoveList& moves,
-                    int start, Move tt_move, Move countermove, int ply) const;
+                    int start, Move tt_move, Move countermove, int (*ch_row)[64], int ply) const;
 
     // Store a killer move for the given ply.
     // Does nothing if the move is already in slot 0.

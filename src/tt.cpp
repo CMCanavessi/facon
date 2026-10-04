@@ -1,5 +1,5 @@
 // =============================================================================
-// Last modified: 2026-05-01 15:37
+// Last modified: 2026-07-17 09:25
 // tt.cpp -- Transposition Table implementation
 //
 // Facon 1.4 -- Hoja
@@ -17,11 +17,47 @@
 //     generation that is sufficiently old. probe() refreshes the generation
 //     of a hit entry to keep it from being aged out while still useful.
 //     hashfull() now reports only entries from the current generation.
+//
+// Facon 1.7 -- Filo
+//   - resize() hardened. Pipeline, in order: the request is clamped to
+//     [HASH_MIN_MB, HASH_MAX_MB] (defense in depth -- the UCI parser clamps
+//     first and reports to the user), capped so that at least
+//     HASH_RAM_RESERVE_MB of physical RAM stays free (a table that lands in
+//     swap turns TT probes into disk seeks), rounded down to a power of two,
+//     and only then allocated. The old table is freed before the new one is
+//     allocated so peak memory never holds both. Allocation uses
+//     new(std::nothrow); on failure the size is halved and retried down to
+//     a 1 MB floor. No Hash request can terminate the process anymore
+//     (previously, an unsatisfiable size aborted via std::terminate under
+//     -fno-exceptions). mb_ now records the size actually allocated, so
+//     print_info() reports the truth (it used to echo the request even
+//     when the table was rounded down).
+//   - available_physical_mb(): new file-local helper reading MemAvailable
+//     on Linux and GlobalMemoryStatusEx() on Windows. Returns 0 when it
+//     cannot tell, in which case no RAM cap is applied.
+//   - Size adjustments are reported as UCI "info string Hash ..." lines on
+//     stdout (rounding, RAM cap, allocation fallback).
+//   - store() carries the node's static evaluation into the entry
+//     (entry.eval, EVAL_NONE for in-check nodes); the stored move shrank
+//     to 16 bits (entry.move16) to make room without growing the entry.
+//     Move preservation on same-hash refresh uses best_move().
 // =============================================================================
 
 #include "tt.h"
 #include <iostream>
 #include <cstring>   // std::memset() in clear()
+#include <cstdio>    // std::fopen() in available_physical_mb() (Linux path)
+#include <new>       // std::nothrow
+
+#if defined(_WIN32)
+// The build system also defines WIN32_LEAN_AND_MEAN for Windows targets
+// (see CMakeLists.txt, Windows-specific settings); the guard keeps this
+// translation unit self-contained without redefining it.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // GlobalMemoryStatusEx() in available_physical_mb()
+#endif
 
 // Global TT instance
 TranspositionTable TT;
@@ -40,6 +76,47 @@ static uint64_t prev_power_of_two(uint64_t n) {
     return p;
 }
 
+// How much physical RAM (in MB) could the process claim right now without
+// pushing the system into swap? Used by resize() to cap oversized requests:
+// a transposition table bigger than available physical RAM gets paged out,
+// and a TT probe that hits swap is a disk seek -- catastrophically slower
+// than probing the smaller table we build instead.
+//
+// The reading is a snapshot and other processes keep allocating, so this is
+// a best-effort cap, not a guarantee; the allocation fallback in resize()
+// stays underneath as the safety net for genuine races.
+//
+// Returns 0 when availability cannot be determined (exotic system, API
+// failure); the caller applies no cap in that case.
+static uint64_t available_physical_mb() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms))
+        return 0;
+    return uint64_t(ms.ullAvailPhys) / (1024 * 1024);
+#else
+    // MemAvailable (Linux 3.14+) is the kernel's own estimate of how much
+    // memory a new workload can claim without swapping -- unlike MemFree,
+    // it counts reclaimable page cache. Parsed with C stdio: no exceptions,
+    // no allocations, safe under -fno-exceptions.
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f)
+        return 0;
+    char               line[128];
+    unsigned long long kb     = 0;
+    uint64_t           result = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::sscanf(line, "MemAvailable: %llu", &kb) == 1) {
+            result = uint64_t(kb) / 1024;
+            break;
+        }
+    }
+    std::fclose(f);
+    return result;
+#endif
+}
+
 // =============================================================================
 // CONSTRUCTOR / RESIZE
 // =============================================================================
@@ -49,15 +126,89 @@ TranspositionTable::TranspositionTable(int mb) {
 }
 
 void TranspositionTable::resize(int mb, bool silent) {
-    uint64_t bytes   = uint64_t(mb) * 1024 * 1024;
+    // Defense in depth: cmd_setoption() clamps and reports out-of-range
+    // values before calling us, but no caller -- present or future -- gets
+    // to reintroduce an out-of-range size. Silent by design: user-facing
+    // range messages belong to the parser, which knows what the user typed.
+    if (mb < HASH_MIN_MB) mb = HASH_MIN_MB;
+    if (mb > HASH_MAX_MB) mb = HASH_MAX_MB;
+
+    // Cap the request to available physical RAM minus a reserve, so the
+    // table never lands in swap. avail == 0 means "could not determine":
+    // no cap is applied and the allocation fallback below absorbs failures.
+    uint64_t request_mb = uint64_t(mb);
+    uint64_t capped_mb  = request_mb;
+    uint64_t avail      = available_physical_mb();
+    if (avail > 0) {
+        uint64_t usable = (avail > uint64_t(HASH_RAM_RESERVE_MB))
+                        ? avail - uint64_t(HASH_RAM_RESERVE_MB)
+                        : uint64_t(HASH_MIN_MB);
+        if (capped_mb > usable)
+            capped_mb = usable;
+    }
+
+    uint64_t bytes   = capped_mb * 1024 * 1024;
     uint64_t entries = bytes / sizeof(TTEntry);
 
-    size_       = prev_power_of_two(entries);
+    size_ = prev_power_of_two(entries);
+
+    // Free the old table BEFORE allocating the new one, so peak memory
+    // never holds both tables at once. With large tables this is the
+    // difference between a resize that fits and one that fails: growing
+    // from 8 GB to 16 GB must not require 24 GB.
+    table_.reset();
+
+    // Allocate with new(std::nothrow). Under -fno-exceptions a failed
+    // ordinary allocation calls std::terminate() -- the exact crash this
+    // function must never produce. On failure, halve and retry down to a
+    // 1 MB floor (halving preserves the power-of-two invariant).
+    //
+    // Residual risk, documented: Linux's default overcommit policy can
+    // grant an allocation that physical memory cannot back, in which case
+    // the OOM killer acts when the value-initialization below touches the
+    // pages. No userspace program can defend against that. The RAM cap
+    // above makes such a grant unlikely in the first place; the window
+    // between our availability snapshot and the zeroing cannot be closed
+    // from here.
+    const uint64_t floor_entries = (1024 * 1024) / sizeof(TTEntry);  // 1 MB
+    TTEntry* raw = nullptr;
+    for (;;) {
+        raw = new (std::nothrow) TTEntry[size_]();  // value-init: zeroed
+        if (raw || size_ <= floor_entries)
+            break;
+        size_ /= 2;
+    }
+    // If even the 1 MB floor failed, raw is null here and the next
+    // allocation anywhere in the process (an std::string, an I/O buffer)
+    // dies the same way: a system in that state cannot run a chess engine
+    // and no recovery is pretended. Unreachable in practice -- the RAM cap
+    // above never requests more than what was available moments earlier.
+    table_.reset(raw);
+
     mask_       = size_ - 1;
-    mb_         = mb;
+    mb_         = int((size_ * sizeof(TTEntry)) / (1024 * 1024));
     generation_ = 0;  // Fresh table starts at generation 0
 
-    table_.assign(size_, TTEntry{});
+    // Report size adjustments as UCI "info string" lines on stdout. At most
+    // one of {RAM cap, power-of-two rounding} fires -- the RAM cap message
+    // subsumes the rounding one, and both report the post-rounding size --
+    // plus the allocation fallback only if a genuine race beat the cap.
+    // Informational messages respect 'silent' (constructor runs before the
+    // banner); an allocation failure prints unconditionally -- if that
+    // fires, being heard matters more than being tidy.
+    uint64_t attempted_mb = (prev_power_of_two(entries) * sizeof(TTEntry))
+                          / (1024 * 1024);
+    if (!silent && capped_mb < request_mb) {
+        std::cout << "info string Hash value exceeds available RAM, reduced to "
+                  << attempted_mb << " MB\n" << std::flush;
+    } else if (!silent && attempted_mb != request_mb) {
+        std::cout << "info string Hash value not a power of two, rounded down to "
+                  << attempted_mb << " MB\n" << std::flush;
+    }
+    if (uint64_t(mb_) < attempted_mb) {
+        std::cout << "info string Hash allocation failed, reduced to "
+                  << mb_ << " MB\n" << std::flush;
+    }
 
     // Diagnostic output goes to stderr -- stdout is reserved for UCI protocol.
     // Suppressed during initial construction (silent=true) because global
@@ -67,7 +218,7 @@ void TranspositionTable::resize(int mb, bool silent) {
 }
 
 void TranspositionTable::clear() {
-    std::memset(table_.data(), 0, size_ * sizeof(TTEntry));
+    std::memset(table_.get(), 0, size_ * sizeof(TTEntry));
     generation_ = 0;  // Reset generation counter on TT.clear() (new game)
 }
 
@@ -83,7 +234,8 @@ void TranspositionTable::new_search() {
 // =============================================================================
 
 void TranspositionTable::store(uint64_t hash, Move move, Score score,
-                                int depth, BoundType bound, int ply) {
+                                Score eval, int depth, BoundType bound,
+                                int ply) {
     TTEntry& entry = table_[index(hash)];
 
     BoundType stored_bound = bound_of(entry.gen_bound);
@@ -116,11 +268,12 @@ void TranspositionTable::store(uint64_t hash, Move move, Score score,
     // losing the PV move when storing a lower-quality result for the same
     // position (e.g. a fail-low storing BOUND_UPPER without a best move).
     if (move == MOVE_NONE && entry.hash == hash)
-        move = entry.move;
+        move = entry.best_move();
 
     entry.hash      = hash;
-    entry.move      = move;
+    entry.move16    = uint16_t(move);
     entry.score     = int16_t(score_to_tt(score, ply));
+    entry.eval      = int16_t(eval);
     entry.depth     = uint8_t(depth);
     entry.gen_bound = make_gen_bound(generation_, bound);
 }
